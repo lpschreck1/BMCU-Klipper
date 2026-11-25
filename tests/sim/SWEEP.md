@@ -6,8 +6,8 @@ Reference print `T0 | T4 T6 | T3`, each fault injected just before the trigger l
 
 | Trigger | Fault | Outcome | First pause message |
 |---|---|---|---|
-| print start | snag T4 58mm | resumed | ENDPOINT_NOT_REACHED: buffer_limit after 58.0 mm |
-| print start | snag T6 58mm | resumed | ENDPOINT_NOT_REACHED: buffer_limit after 58.0 mm |
+| print start | snag T4 58mm | resumed | ENDPOINT_NOT_REACHED: buffer_limit after 58.0 mm. Check the path for a snag or kink, and that the tip is cut clean; this Head is shared, so also check that no other source's filament is parked past the splitter (bmcu0 Ch |
+| print start | snag T6 58mm | resumed | ENDPOINT_NOT_REACHED: buffer_limit after 58.0 mm. Check the path for a snag or kink, and that the tip is cut clean; this Head is shared, so also check that no other source's filament is parked past the splitter (bmcu0 Ch |
 | print start | clog head 3 | resumed | U1_TOOLHEAD_NOT_LOADED: Head 3 saw no convincing downstream start-to-finish coil response during the normal BEFORE_ON_USE path (path_delta=0.0, gentle_required>=400.0) after 2 final read(s). BMCU pressure and Head motion |
 | print start | clog head 4 | resumed | U1_TOOLHEAD_NOT_LOADED: Head 4 saw no convincing downstream start-to-finish coil response during the normal BEFORE_ON_USE path (path_delta=0.0, gentle_required>=400.0) after 2 final read(s). BMCU pressure and Head motion |
 | print start | deformed T4 | resumed | U1_TOOLHEAD_NOT_LOADED: Head 3 saw no convincing downstream start-to-finish coil response during the normal BEFORE_ON_USE path (path_delta=0.0, gentle_required>=400.0) after 2 final read(s). BMCU pressure and Head motion |
@@ -15,7 +15,7 @@ Reference print `T0 | T4 T6 | T3`, each fault injected just before the trigger l
 | print start | deformed stock T0 | resumed | extruder[0]: state: load_extruding, error: move_extrude! |
 | print start | deformed stock T3 | resumed | extruder[3]: state: load_extruding, error: move_extrude! |
 | auto feed T0 | deformed stock T0 | resumed | extruder[0]: state: load_extruding, error: move_extrude! |
-| auto feed head 3 | snag T4 58mm | resumed | ENDPOINT_NOT_REACHED: buffer_limit after 58.0 mm |
+| auto feed head 3 | snag T4 58mm | resumed | ENDPOINT_NOT_REACHED: buffer_limit after 58.0 mm. Check the path for a snag or kink, and that the tip is cut clean; this Head is shared, so also check that no other source's filament is parked past the splitter (bmcu0 Ch |
 | auto feed head 3 | clog head 3 | resumed | U1_TOOLHEAD_NOT_LOADED: Head 3 saw no convincing downstream start-to-finish coil response during the normal BEFORE_ON_USE path (path_delta=0.0, gentle_required>=400.0) after 2 final read(s). BMCU pressure and Head motion |
 | auto feed head 3 | deformed T4 | resumed | U1_TOOLHEAD_NOT_LOADED: Head 3 saw no convincing downstream start-to-finish coil response during the normal BEFORE_ON_USE path (path_delta=0.0, gentle_required>=400.0) after 2 final read(s). BMCU pressure and Head motion |
 | auto feed head 4 | clog head 4 | resumed | U1_TOOLHEAD_NOT_LOADED: Head 4 saw no convincing downstream start-to-finish coil response during the normal BEFORE_ON_USE path (path_delta=0.0, gentle_required>=400.0) after 2 final read(s). BMCU pressure and Head motion |
