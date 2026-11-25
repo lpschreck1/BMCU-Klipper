@@ -7,15 +7,15 @@ on:
 jobs:
   unit:
     runs-on: ubuntu-latest
+    # The official Python images keep 3.8 available after setup-python
+    # dropped it from current Ubuntu runners.
+    container: python:${{ matrix.python-version }}-slim
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.8", "3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+      - uses: actions/checkout@v5
       - name: Install test dependencies
         run: python -m pip install greenlet
       - name: Byte-compile host code

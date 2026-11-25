@@ -199,7 +199,6 @@ class Incident6StockPrintOnBmcuHeadTest(unittest.TestCase):
     # FINDINGS.md F1: SM_PRINT_AUTO_FEED's hand-back path never caps the pending retract
     # (printing_e_pos), so Snapmaker's flush pulls the new stock filament back out of the
     # nozzle and the first moves of the print are dry.
-    @unittest.expectedFailure
     def test_stock_print_lays_down_plastic_after_the_hand_back(self):
         sim = Sim.reference_machine()
         self.addCleanup(sim.close)
@@ -267,7 +266,6 @@ class Incident8ParkedInSharedTubeTest(unittest.TestCase):
         self.assertEqual(sim.world.consistent(), [])
 
     # FINDINGS.md F2 (diagnostics): the pause names no cause.
-    @unittest.expectedFailure
     def test_pause_message_names_the_blocking_channel(self):
         sim = self.setup_print()
         sim.start()
@@ -283,7 +281,6 @@ class Incident9UnrecordedFilamentTest(unittest.TestCase):
     # FINDINGS.md F3: the channel is identified and marked LOADED, then the load that
     # follows refuses it: "u1_head2 has BMCU route ownership without a captured native
     # feeder baseline" (manager._arm_u1_persistent_hold).
-    @unittest.expectedFailure
     def test_identified_kept_then_swapped_for_t5(self):
         sim = make_sim(self, plan=[[0], [4, 5], [3]],
                        spools={0: 'PLA grey', 4: 'PLA red', 5: 'PLA blue', 3: 'PLA white'})
@@ -333,7 +330,6 @@ class FoundByTheSimulatorTest(unittest.TestCase):
     # FINDINGS.md F4: a fault-free print whose Head 4 goes T6 -> (another head) -> stock T3
     # pauses: the background worker that hands the head back to its stock feeder is refused
     # by _handoff_u1_to_native because the worker still holds its own endpoint/path locks.
-    @unittest.expectedFailure
     def test_background_handoff_to_the_stock_feeder_is_not_blocked_by_its_own_locks(self):
         sim = make_sim(self, plan=[[0], [6], [4], [3]])
         self.assertEqual(sim.run_print(), 'complete', sim.print_stats.message)
