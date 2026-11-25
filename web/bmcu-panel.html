@@ -303,6 +303,18 @@ BMCU_PRINT_COMMIT</pre>
     </form>
   </dialog>
 
+  <dialog id="stockPreloadDialog" class="dialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><h2 id="stockPreloadTitle">Stock feeder</h2></div><button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button></div>
+      <div id="stockPreloadNotice" class="notice compact"></div>
+      <div class="form-grid">
+        <label class="field full"><span>Preload length</span><div class="length-pair"><div class="input-with-unit"><input id="editStockPreload" type="number" min="60" max="150" step="0.1" value="85" inputmode="decimal"><span>cm</span></div><div class="input-with-unit converted-length"><input id="editStockPreloadInches" type="text" value="33.46" readonly tabindex="-1" aria-label="Preload length in inches"><span>in</span></div></div><small id="editStockPreloadHelp">How far the stock feeder pushes newly inserted filament before parking it. It stops sooner if the filament reaches the Head. 60-150 cm. Default: 85 cm.</small></label>
+        <label class="switch-row full"><span><strong>Use the printer.cfg value</strong><small id="stockPreloadCfgHelp">Let Snapmaker's own preload_length apply instead.</small></span><input id="editStockPreloadCfg" type="checkbox"></label>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" value="cancel" type="submit">Cancel</button><button id="saveStockPreload" class="button primary" value="default" type="button">Save preload</button></div>
+    </form>
+  </dialog>
+
   <dialog id="channelDialog" class="dialog">
     <form method="dialog" class="dialog-card">
       <div class="dialog-head"><div><h2 id="channelDialogTitle">Channel</h2></div><button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button></div>
@@ -316,7 +328,7 @@ BMCU_PRINT_COMMIT</pre>
         <label class="field"><span>Priority</span><input id="editRefillPriority" type="number" min="0" max="10000"></label>
         <label id="editLogicalToolRow" class="field hidden"><span>Slot</span><select id="editLogicalTool"></select><small id="editLogicalToolHelp">Physical heads use 1 (T0)-4 (T3). BMCU uses 5 (T4)-32 (T31). Changing this requires updating the OrcaSlicer printer profile or Machine G-code.</small></label>
         <label class="field full"><span>Retraction length</span><div class="length-pair"><div class="input-with-unit"><input id="editUnloadRetract" type="number" min="1" max="200" step="0.01" value="20" inputmode="decimal"><span>cm</span></div><div class="input-with-unit converted-length"><input id="editUnloadRetractInches" type="text" value="7.87" readonly tabindex="-1" aria-label="Retraction length in inches"><span>in</span></div></div><small>Distance pulled back after unloading.</small></label>
-        <label class="field full"><span>Autoload length</span><div class="length-pair"><div class="input-with-unit"><input id="editAutoload" type="number" min="1" max="100" step="0.01" value="12" inputmode="decimal"><span>cm</span></div><div class="input-with-unit converted-length"><input id="editAutoloadInches" type="text" value="4.72" readonly tabindex="-1" aria-label="Autoload length in inches"><span>in</span></div></div><small id="editAutoloadHelp">Initial feed after filament is detected. Default: 12 cm.</small></label>
+        <label class="field full"><span>Autoload length</span><div class="length-pair"><div class="input-with-unit"><input id="editAutoload" type="number" min="1" max="200" step="0.01" value="12" inputmode="decimal"><span>cm</span></div><div class="input-with-unit converted-length"><input id="editAutoloadInches" type="text" value="4.72" readonly tabindex="-1" aria-label="Autoload length in inches"><span>in</span></div></div><small id="editAutoloadHelp">Initial feed after filament is detected. Default: 12 cm.</small></label>
         <label class="switch-row full"><span><strong>Automatic refill</strong><small>Allow this source to replace another compatible source.</small></span><input id="editRefill" type="checkbox"></label>
       </div>
       <div class="dialog-actions"><button class="button secondary" value="cancel" type="submit">Cancel</button><button id="saveChannel" class="button primary" value="default" type="button">Save filament</button></div>

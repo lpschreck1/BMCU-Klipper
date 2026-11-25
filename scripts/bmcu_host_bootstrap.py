@@ -454,6 +454,40 @@ def _wait_transport_online(process, status_file, name, expected_uid, timeout):
     raise BootstrapError(
         'preferred BMCU transport did not become online: %s' % last)
 
+def _transport_reusable_state(status_file, pid, name, expected_uid):
+    """Whether a running transport helper may be kept across a Klipper start.
+
+    Keeping it preserves a live BMCU session, so only a helper that has one (or
+    has deliberately released the port for a firmware update) is kept. A helper
+    still without a session is restarted: one that opened the port during a bad
+    boot was kept through every later Klipper restart and never reconnected."""
+    try:
+        info = os.lstat(status_file)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            return False, 'its status file is unsafe'
+        if info.st_size > MAX_JSON:
+            return False, 'its status file is too large'
+        with open(status_file, 'r') as stream:
+            value = json.load(stream)
+    except (OSError, ValueError) as exc:
+        return False, 'its status is unreadable (%s)' % exc
+    if not isinstance(value, dict) or str(value.get('name') or '') != str(name):
+        return False, 'its status belongs to another device'
+    try:
+        if int(value.get('pid', 0) or 0) != int(pid or 0):
+            return False, 'its status file is from another process'
+    except (TypeError, ValueError):
+        return False, 'its status file has no valid PID'
+    if bool(value.get('serial_released')):
+        return True, 'released for a firmware update'
+    uid = str(value.get('uid') or '').upper()
+    expected = str(expected_uid or '').upper()
+    if bool(value.get('online')) and bool(value.get('serial_open')) and (
+            not expected or uid == expected):
+        return True, 'online'
+    return False, 'has no BMCU session (phase %s)' % (
+        value.get('handshake_phase') or ('port closed' if not value.get('serial_open') else 'unknown'))
+
 def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferred_online_timeout=0.0):
 
     runtime = os.path.realpath(os.path.join(bmcu_dir, 'runtime'))
@@ -481,12 +515,15 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
     except KeyError:
         raise BootstrapError('invalid Klipper user/group for BMCU transport')
     socket_dir = config['socket_dir']
-    if os.path.lexists(socket_dir):
-        if os.path.islink(socket_dir) or not os.path.isdir(socket_dir):
-            raise BootstrapError('unsafe BMCU transport socket directory')
-    else:
-        os.makedirs(socket_dir, 0o700)
-    directory_info = os.stat(socket_dir)
+    try:
+        if os.path.lexists(socket_dir):
+            if os.path.islink(socket_dir) or not os.path.isdir(socket_dir):
+                raise BootstrapError('unsafe BMCU transport socket directory')
+        else:
+            os.makedirs(socket_dir, 0o700)
+        directory_info = os.stat(socket_dir)
+    except PermissionError:
+        raise BootstrapError(_socket_dir_access_message(socket_dir, user))
     if directory_info.st_uid != uid or directory_info.st_gid != gid:
         if os.geteuid() != 0:
             raise BootstrapError(
@@ -557,8 +594,13 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
                    os.path.exists(socket_path) and
                    os.path.exists(socket_path + '.ctl'))
         if current:
-            records[name] = old
-            continue
+            healthy, why = _transport_reusable_state(
+                status_file, old.get('pid'), name, item.get('uid', ''))
+            if healthy:
+                records[name] = old
+                continue
+            print('BMCU transport %s (pid %s) is running but %s; restarting it' %
+                  (name, old.get('pid'), why), file=sys.stderr)
         _stop_transport_record(old, runtime)
         command = [
             sys.executable, '-I', '-S', daemon,
@@ -1350,6 +1392,32 @@ def remove(metadata_path, quiet=False):
 def default_metadata():
     scripts_dir = os.path.dirname(os.path.realpath(__file__))
     return os.path.join(os.path.dirname(scripts_dir), 'INSTALLATION.json')
+
+def _socket_dir_access_message(socket_dir, user):
+    """Explain why the Klipper user can't create or open the transport socket
+    directory, naming the parent folder, its mode and owner, and the usual fix."""
+    parent = os.path.dirname(os.path.abspath(socket_dir)) or '/'
+    try:
+        info = os.stat(parent)
+        mode = stat.S_IMODE(info.st_mode)
+        try:
+            owner = pwd.getpwuid(info.st_uid).pw_name
+        except KeyError:
+            owner = str(info.st_uid)
+        detail = '%s is mode %04o, owned by %s' % (parent, mode, owner)
+    except OSError as exc:
+        mode = None
+        detail = '%s cannot be read (%s)' % (parent, exc)
+    message = ('the Klipper user %s cannot create or open the BMCU transport socket '
+               'directory %s: %s.' % (user or '?', socket_dir, detail))
+    if parent == '/tmp' and mode is not None and mode != 0o1777:
+        message += (' /tmp should be mode 1777 (drwxrwxrwt); a copy into /tmp '
+                    'can change it. Fix with: chmod 1777 /tmp')
+    elif os.path.lexists(socket_dir):
+        message += (' Remove the stale directory as root and restart Klipper: '
+                    'rm -rf %s' % socket_dir)
+    return message
+
 
 def main():
     parser = argparse.ArgumentParser(prog='bmcu_host_bootstrap')

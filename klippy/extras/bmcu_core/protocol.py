@@ -525,8 +525,8 @@ def pack_runtime_sync(values, rgb, policy=None, channel_retract_m=None,
     if include_channel_autoload:
         _require_finite(channel_autoload_m, 'Channel autoload distance')
         for value in channel_autoload_m:
-            if value < 0.010 or value > 1.000:
-                raise ValueError('Channel autoload distance must be within 10..1000 mm')
+            if value < 0.010 or value > 2.000:
+                raise ValueError('Channel autoload distance must be within 10..2000 mm')
         ordered += tuple(float(value) for value in channel_autoload_m)
     if not isinstance(rgb, (tuple, list)) or len(rgb) != 3:
         raise ValueError('runtime RGB must contain exactly three values')

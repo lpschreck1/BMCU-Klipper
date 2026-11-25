@@ -52,6 +52,7 @@ function syncLengthConversions() {
   };
   sync('editUnloadRetract', 'editUnloadRetractInches');
   sync('editAutoload', 'editAutoloadInches');
+  sync('editStockPreload', 'editStockPreloadInches');
 }
 function deviceNumericId(deviceOrName) {
   const name = typeof deviceOrName === 'string' ? deviceOrName : deviceOrName?.name;
@@ -678,6 +679,7 @@ function u1PathSummary(endpointName, endpoint, sources) {
       : channelState === 'unload_finish'
         ? {label: 'Stock still in path', cls: 'warn', detail: 'Snapmaker finished its hotend retract/cut sequence, but the stock feeder cannot pull this filament back through the shared branch. Manual retract is required before BMCU uses this Head.'}
         : {label: 'Stock path occupied', cls: 'warn', detail: `Snapmaker feeder state: ${channelState || 'busy'}.`};
+    if (path.preload_clear === true) return {label: 'Stock preloaded · path clear', cls: 'good', detail: 'The stock feeder parked its filament before the shared path joins (SNAP_PRELOAD_CLEAR is on for this Head).'};
     if (path.input_released === true) return {label: 'Stock input clear', cls: 'good', detail: 'The stock feeder reports its input clear. Manual stock withdrawal is user-managed; automatic runout handoff is entered only from the Snapmaker Head runout callback.'};
     return {label: 'Stock feeder available', cls: 'good', detail: 'Snapmaker is not reporting an occupied stock-feed state. This does not claim that the complete manual PTFE path is physically empty.'};
   }
@@ -1376,6 +1378,9 @@ function renderOwnership() {
     else stockBadges.push(['Input sensor unknown', 'warn']);
     if (stock.user_auto_enabled === true) stockBadges.push(['Auto feed on', '']);
     else if (stock.user_auto_enabled === false) stockBadges.push(['Auto feed off', '']);
+    const preloadLength = endpoint?.capabilities?.u1_preload_length || null;
+    if (preloadLength?.supported && preloadLength.active_mm)
+      stockBadges.push([`Preload ${((preloadLength.configured_mm > 0 ? preloadLength.configured_mm : preloadLength.active_mm) / 10).toFixed(0)} cm`, '']);
     replaceBadges(stockRow.querySelector('.source-badges'), stockBadges);
 
     let restore = node.querySelector('.restore-native-feeder');
@@ -1397,6 +1402,48 @@ function renderOwnership() {
       `Enable native auto feed for Head ${head + 1}? This preference will be saved. The shared path must be clear of BMCU filament.`,
       () => run(`BMCU_SNAP_FEEDER ENDPOINT=${gcodeValue(name)} TAKEOVER=0 AUTO=1`,
         {success: `Head ${head + 1} native auto feed enabled.`}));
+
+    let stockEdit = node.querySelector('.edit-stock-preload');
+    if (!stockEdit) {
+      stockEdit = document.createElement('button');
+      stockEdit.type = 'button';
+      stockEdit.className = 'small-action edit-stock-preload';
+      stockEdit.textContent = 'Edit';
+      stockRow.querySelector('.source-badges').after(stockEdit);
+    }
+    stockEdit.disabled = ui.busy || !preloadLength;
+    stockEdit.title = preloadLength ? 'Stock feeder preload length' : 'This BMCU-Klipper build does not report the preload length.';
+    stockEdit.onclick = () => openStockPreloadEditor(name);
+
+    let preload = node.querySelector('.preload-clear-option');
+    if (!preload) {
+      preload = document.createElement('label');
+      preload.className = 'confirm-check preload-clear-option';
+      preload.innerHTML = '<input type="checkbox"><span><strong>Stock preload parks before the BMCU join</strong>' +
+        '<small>Lets BMCU use this Head while a stock spool is preloaded. Only turn on if the preload stops before ' +
+        'the BMCU tube joins (for example, before a splitter); otherwise BMCU filament would run into it.</small></span>';
+      stockRow.parentElement.append(preload);
+    }
+    const preloadBox = preload.querySelector('input');
+    const preloadKnown = typeof endpoint?.capabilities?.u1_preload_clear === 'boolean';
+    const preloadOn = endpoint?.capabilities?.u1_preload_clear === true;
+    preloadBox.checked = preloadOn;
+    preloadBox.disabled = ui.busy || !preloadKnown;
+    preload.title = preloadKnown ? '' : 'This BMCU-Klipper build does not report this setting.';
+    preloadBox.onchange = () => {
+      const want = preloadBox.checked;
+      preloadBox.checked = preloadOn;
+      const script = `BMCU_SET_ENDPOINT NAME=${gcodeValue(name)} SNAP_PRELOAD_CLEAR=${want ? 1 : 0}`;
+      const success = `Head ${head + 1}: stock preload ${want ? 'treated as clear of' : 'treated as occupying'} the shared path.`;
+      if (want) {
+        confirmAction('Stock preload parks before the BMCU join',
+          `Only turn this on if Head ${head + 1}'s preloaded stock filament stops before the point where the BMCU tube joins its path. ` +
+          'If it reaches past the join, BMCU filament would be pushed into it and jam the Head.',
+          () => run(script, {success}));
+      } else {
+        run(script, {success}).catch(() => {});
+      }
+    };
 
     const sourceList = node.querySelector('.bmcu-source-list');
     if (!sources.length) {
@@ -3549,6 +3596,64 @@ function openChannelEditor(deviceName, channelIndex) {
   openDialog($('channelDialog'));
 }
 
+function u1SideHeads(module) {
+  return Object.values(endpoints())
+    .filter((candidate) => candidate?.driver === 'snapmaker_u1' &&
+      String(candidate?.capabilities?.u1_feeder_module || '') === module)
+    .map((candidate) => Number(candidate.head_index) + 1)
+    .sort((a, b) => a - b);
+}
+
+function openStockPreloadEditor(endpointName) {
+  const endpoint = endpoints()[endpointName];
+  const preload = endpoint?.capabilities?.u1_preload_length;
+  if (!endpoint || !preload) return;
+  const module = String(endpoint.capabilities.u1_feeder_module || '');
+  const side = module === 'right' ? 'Right' : 'Left';
+  const heads = u1SideHeads(module);
+  ui.editingStockPreload = {module};
+  text($('stockPreloadTitle'), `${side} stock feeder`);
+  const notice = $('stockPreloadNotice');
+  notice.className = `notice compact ${preload.supported ? '' : 'warning'}`.trim();
+  notice.replaceChildren();
+  const icon = document.createElement('span');
+  icon.className = 'notice-icon';
+  text(icon, preload.supported ? 'i' : '!');
+  const body = document.createElement('div');
+  const title = document.createElement('h3');
+  text(title, `Applies to Head ${heads.join(' and Head ')}`);
+  const copy = document.createElement('p');
+  text(copy, preload.supported
+    ? `Snapmaker uses one preload length per feeder, so this changes both Heads on the ${side.toLowerCase()} side. Currently ${preload.configured_mm > 0 ? `${(preload.configured_mm / 10).toFixed(1)} cm` : `printer.cfg's value (about ${(preload.active_mm / 10).toFixed(0)} cm)`}.`
+    : "This Snapmaker firmware doesn't expose the preload length to BMCU. The setting is saved but printer.cfg still applies.");
+  body.append(title, copy);
+  notice.append(icon, body);
+  const useCfg = !(preload.configured_mm > 0);
+  $('editStockPreloadCfg').checked = useCfg;
+  $('editStockPreload').value = (useCfg ? 85 : preload.configured_mm / 10).toFixed(1);
+  $('editStockPreload').disabled = useCfg;
+  text($('stockPreloadCfgHelp'), preload.printer_cfg_mm
+    ? `Let Snapmaker's own preload_length apply instead (about ${(preload.printer_cfg_mm / 10).toFixed(0)} cm).`
+    : "Let Snapmaker's own preload_length apply instead.");
+  syncLengthConversions();
+  openDialog($('stockPreloadDialog'));
+}
+
+async function saveStockPreloadEditor() {
+  if (!ui.editingStockPreload) return;
+  const {module} = ui.editingStockPreload;
+  const useCfg = $('editStockPreloadCfg').checked;
+  const length = useCfg ? 0 : mmFromCm($('editStockPreload').value);
+  if (!useCfg && (!finite(length) || length < 600 || length > 1500)) {
+    toast('Preload length must be between 60 and 150 cm.', 'error');
+    return;
+  }
+  await run(`BMCU_SET_PRELOAD SIDE=${module} LENGTH=${useCfg ? 0 : length.toFixed(0)}`,
+    {success: useCfg ? 'Stock feeder preload set back to printer.cfg.' : `Stock feeder preload set to ${(length / 10).toFixed(1)} cm.`});
+  ui.editingStockPreload = null;
+  closeDialog($('stockPreloadDialog'));
+}
+
 async function saveChannelEditor() {
   if (!ui.editing) return;
   const retract = mmFromCm($('editUnloadRetract').value);
@@ -3557,8 +3662,8 @@ async function saveChannelEditor() {
     toast('Retraction must be between 10 and 2000 mm.', 'error');
     return;
   }
-  if (!finite(autoload) || autoload < 10 || autoload > 1000) {
-    toast('Autoload must be between 10 and 1000 mm.', 'error');
+  if (!finite(autoload) || autoload < 10 || autoload > 2000) {
+    toast('Autoload must be between 10 and 2000 mm.', 'error');
     return;
   }
   const snapmaker = printerInfo().topology === 'snapmaker_u1';
@@ -4726,6 +4831,9 @@ function bindEvents() {
   $('saveRoutes').addEventListener('click', saveRoutes);
   $('discardRoutes').addEventListener('click', discardRoutes);
   $('saveChannel').addEventListener('click', () => saveChannelEditor().catch(() => {}));
+  $('saveStockPreload').addEventListener('click', () => saveStockPreloadEditor().catch(() => {}));
+  $('editStockPreload').addEventListener('input', syncLengthConversions);
+  $('editStockPreloadCfg').addEventListener('change', () => { $('editStockPreload').disabled = $('editStockPreloadCfg').checked; });
   $('channelDialog').addEventListener('close', () => { ui.editing = null; });
   $('channelDialog').addEventListener('cancel', () => { ui.editing = null; });
   $('editUnloadRetract').addEventListener('input', syncLengthConversions);

@@ -435,3 +435,9 @@ html.dialog-open,html.dialog-open body{overflow:hidden;}
 #diagnosticsExportDialog .dialog-head{align-items:flex-start;}
 #diagnosticsExportDialog .dialog-head p{margin:5px 0 0;color:var(--muted);font-size:13px;line-height:1.45;}
 @media (max-width:640px){.diagnostics-export-options{grid-template-columns:1fr;}.page-heading>.button{width:100%;}}
+.preload-clear-option{display:flex;grid-template-columns:none;align-items:flex-start;gap:10px;margin-top:10px;padding:9px 11px;cursor:pointer}
+.preload-clear-option input{flex:0 0 auto;width:16px;height:16px;margin:2px 0 0}
+.preload-clear-option span{flex:1 1 auto;display:grid;gap:3px}
+.preload-clear-option strong{font-size:13px}.preload-clear-option small{font-size:12px;line-height:1.4}
+.stock-source-row:has(.edit-stock-preload){grid-template-columns:auto minmax(130px,1fr) minmax(190px,auto) auto;}
+@media (max-width:620px){.stock-source-row:has(.edit-stock-preload){grid-template-columns:auto minmax(0,1fr) auto;}.stock-source-row .edit-stock-preload{grid-column:3;grid-row:1;}}

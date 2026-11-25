@@ -631,6 +631,12 @@ def verify_helpers(bmcu_dir, panel_enabled, panel_port, timeout=60.0):
         if wait_panel(panel_port, max(10.0, deadline - time.monotonic() + 30.0)):
             return True
         warn('the BMCU panel is not answering on port %d yet' % panel_port)
+    if (expected and expected - running) or panel_enabled:
+        log_dir = lifecycle.U1_LOG_DIR
+        if not os.path.isdir(log_dir) or not os.access(log_dir, os.W_OK):
+            log_dir = bmcu_dir
+        warn('if it stays that way, check %s (bmcu-panel.log, bmcu-transport-<device>.log) '
+             'and the Klipper service output for "host bootstrap failed"' % log_dir)
     return False
 
 

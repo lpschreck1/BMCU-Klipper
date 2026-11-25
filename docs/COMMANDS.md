@@ -283,8 +283,8 @@ Main parameters:
 | `SPOOL_ID` | Spool identifier. |
 | `TOOL` | Logical `T` assigned to the channel. |
 | `TEMP_MIN`, `TEMP_MAX` | Informational material temperature limits. |
-| `UNLOAD_RETRACT_MM` | Retraction length used by channel policy during unload. |
-| `AUTOLOAD_MM` | Service/autoload filament feed length for the channel. |
+| `UNLOAD_RETRACT_MM` | Retraction length used by channel policy during unload, 10-2000 mm. |
+| `AUTOLOAD_MM` | Service/autoload filament feed length for the channel, 10-2000 mm (needs BMCU firmware 1.0.5). An autoload longer than 1000 mm stops once after the first 1000 mm, waits 30 seconds, then feeds the rest. Keep it shorter than the tube from the BMCU to any splitter or shared path: autoload has no sensor at the join, so a longer value parks the filament in the shared tube, where it blocks the other sources. |
 | `REFILL` | Enable/disable use of the channel as a refill source. |
 | `REFILL_PRIORITY` | Refill priority. |
 | `REFILL_GROUP` | Refill compatibility group. |
@@ -388,6 +388,14 @@ BEFORE_PULLBACK_MACRO
 For Generic, `ENTRY_SENSOR`, `POST_GEARS_SENSOR` or `MOTION_SENSOR` provides physical confirmation that the old filament has ended. A configuration without a sensor pauses the print after the BMCU input is confirmed empty. A ready backup starts automatic refill. Manual same-channel refill uses normal `RESUME`: BMCU performs a full `LOAD`, then resumes the printer after it succeeds.
 
 For U1, additional `SNAP_*` fields are managed by the preset and panel. The full U1 model is described in the [Snapmaker U1 README](../printers/Snapmaker_U1/README.md).
+
+`SNAP_PRELOAD_CLEAR=1` treats a stock feeder in the `preload_finish` state as leaving the shared path clear. Enable it only for a head whose stock feeder parks preloaded filament before the point where the BMCU route joins that head's path:
+
+```gcode
+BMCU_SET_ENDPOINT NAME=u1_head3 SNAP_PRELOAD_CLEAR=1
+```
+
+It is off by default, and can also be set with the **Stock preload parks before the BMCU join** checkbox on each Head's card in the panel. Unloaded stock filament (`unload_finish`) is still treated as occupying the path.
 
 ### Generic macro contract
 
@@ -561,7 +569,15 @@ BMCU_HEAD_CONFIRM_EMPTY HEAD=2
 BMCU_HEAD_CONFIRM_EMPTY ENDPOINT=u1_head1
 ```
 
-The command extends confirmation with U1 state and path-ownership checks.
+The command extends confirmation with U1 state and path-ownership checks. The head's own filament sensor must read empty, and every BMCU Channel routed to the head must be firmware EMPTY.
+
+If the stock feeder still detects filament at its input, the stock path reads as occupied and the command refuses. Pull the filament out of the stock feeder; or, if you pulled the stock filament back clear of the point where the BMCU route joins, confirm that explicitly:
+
+```gcode
+BMCU_HEAD_CONFIRM_EMPTY HEAD=4 STOCK_RETRACTED=1
+```
+
+`STOCK_RETRACTED=1` only skips the stock-path check. It is logged, and the stock feeder's state is recorded as unloaded.
 
 ### `BMCU_RECONCILE`
 
@@ -711,6 +727,12 @@ BMCU_AUTO_FEED EXTRUDER=1 INITIAL_TOOL={initial_extruder} REQUIRE_PLAN=1
 
 If the source is a native feeder, the operation is delegated to the stock workflow. If the source is BMCU, the correct BMCU channel is loaded.
 
+Before choosing the source, it checks the head's entry sensor. If the sensor sees filament that no loaded BMCU route and no loaded stock feeder accounts for (for example a head left loaded by an interrupted or manual operation), BMCU identifies it instead of loading on top of it: it heats the head at the purge position, extrudes 15 mm, and records as loaded the one BMCU channel whose encoder followed. The normal source selection then keeps that filament if it is the one the print needs, or unloads it and loads the right one. If no channel followed (stock or unknown filament) or the result isn't clear-cut, the print pauses with the head named and the measured movement of each channel.
+
+The same identification runs before any BMCU load into a U1 head during a print (including the reload when a paused print resumes), so a retry after a failed or interrupted load continues with the filament that is there instead of stopping on "residual filament". BMCU's own staged filament, which waits at the head sensor by design, is not treated as unrecorded.
+
+When a BMCU print is resumed, BMCU first restores the paused head's filament info (material and "filament present") from the BMCU source that head will hold: the loaded channel, else the tool change that was in progress, else the head's next planned BMCU tool. A failed load clears that info, and Snapmaker's resume checks would otherwise refuse the head ("filament runout" / "not edit filament") before BMCU could load it. If that BMCU channel itself has no filament, the info is left alone so a real runout still stops the print.
+
 ### `BMCU_SNAP_CHECK`
 
 Snapmaker U1 endpoint check:
@@ -720,6 +742,19 @@ BMCU_SNAP_CHECK ENDPOINT=u1_head1 STRICT=1
 ```
 
 Intended for diagnostics/verification of the U1 integration.
+
+### `BMCU_SET_PRELOAD`
+
+Sets how far a U1 stock feeder pushes newly inserted filament before parking it (Snapmaker's `preload_length`):
+
+```gcode
+BMCU_SET_PRELOAD SIDE=right LENGTH=800
+BMCU_SET_PRELOAD HEAD=4 LENGTH=800
+```
+
+Snapmaker keeps one preload length per feeder unit, so the setting covers both Heads on that side: `left` is Heads 1 and 2, `right` is Heads 3 and 4 (`HEAD=` picks the side for you). `LENGTH` is in mm, 600-1500 (Snapmaker's own limits). The preload still stops early if the filament reaches the Head sensor. `LENGTH=0` goes back to the `preload_length` in `printer.cfg`.
+
+The default is 850 mm (Snapmaker's own is 950 mm): it keeps a preloaded stock spool further back from a shared BMCU path without adding so much feed distance that a long stock route runs into Snapmaker's 60 s load limit. BMCU applies the setting to Snapmaker's feeder at every start, so it survives a firmware update rewriting `printer.cfg`; `printer.cfg` itself is not changed. If the Snapmaker firmware doesn't expose the value, BMCU logs a warning and `printer.cfg` applies. Each Head card in the panel has an **Edit** button on its stock source for this.
 
 ### `BMCU_SNAP_FEEDER`
 

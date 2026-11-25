@@ -333,7 +333,7 @@ def _clean_channel_state(raw, channel):
         'unload_retract_mm': _clamp_float(
             raw.get('unload_retract_mm'), 200.0, 10.0, 2000.0),
         'autoload_mm': _clamp_float(
-            raw.get('autoload_mm'), 120.0, 10.0, 1000.0),
+            raw.get('autoload_mm'), 120.0, 10.0, 2000.0),
 
         'path_length_mm': _clamp_float(
             raw.get('path_length_mm'), 0.0, 0.0, 5000.0),

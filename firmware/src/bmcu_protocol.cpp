@@ -285,7 +285,7 @@ static bool runtime_value_valid(uint8_t index, float value)
     case 10u:
     case 11u:
     case 12u:
-    case 13u: return value >= 0.010f && value <= 1.000f;
+    case 13u: return value >= 0.010f && value <= 2.000f;
     default: return false;
     }
 }

@@ -240,6 +240,10 @@ static constexpr uint64_t DM_AUTO_FAIL_EXTRA_MS        = 1500ull;
 static constexpr float    DM_AUTO_PWM_PUSH             = 900.0f;
 static constexpr float    DM_AUTO_PWM_PULL             = 900.0f;
 static constexpr float    DM_AUTO_IDLE_LIM             = 950.0f;
+// Autoloads longer than this stop once after this distance and wait
+// DM_AUTO_PAUSE_MS before feeding the rest.
+static constexpr float    DM_AUTO_PAUSE_AFTER_M        = 1.000f;
+static constexpr uint64_t DM_AUTO_PAUSE_MS             = 30000ull;
 
 enum : uint8_t
 {
@@ -251,6 +255,7 @@ enum : uint8_t
     DM_AUTO_S2_RETRACT,
     DM_AUTO_S2_FAIL_RETRACT,
     DM_AUTO_S2_FAIL_EXTRA,
+    DM_AUTO_S2_PAUSE,
 };
 
 static uint8_t  dm_loaded[4]            = {1,1,1,1};
@@ -261,6 +266,7 @@ static uint8_t  dm_auto_try[4]          = {0,0,0,0};
 static uint64_t dm_auto_t0_ms[4]        = {0ull,0ull,0ull,0ull};
 static float    dm_auto_remain_m[4]     = {0,0,0,0};
 static float    dm_auto_last_m[4]       = {0,0,0,0};
+static uint8_t  dm_auto_paused[4]       = {0,0,0,0};
 static uint8_t  dm_idle_empty[4]         = {0,0,0,0};
 
 static uint64_t dm_loaded_drop_t0_ms[4] = {0ull,0ull,0ull,0ull};
@@ -547,6 +553,7 @@ void Motion_control_prepare_calibration(void)
         dm_auto_t0_ms[i] = 0ull;
         dm_auto_remain_m[i] = 0.0f;
         dm_auto_last_m[i] = 0.0f;
+        dm_auto_paused[i] = 0u;
         dm_idle_empty[i] = 0u;
 #endif
     }
@@ -1325,6 +1332,7 @@ public:
                                     dm_auto_try[CHx]      = 0u;
                                     dm_auto_remain_m[CHx] = bmcu_config_autoload_len(CHx);
                                     dm_auto_last_m[CHx]   = cur_m;
+                                    dm_auto_paused[CHx]   = 0u;
                                 }
                             }
 
@@ -1341,6 +1349,7 @@ public:
                                     dm_auto_try[CHx]      = 0u;
                                     dm_auto_remain_m[CHx] = bmcu_config_autoload_len(CHx);
                                     dm_auto_last_m[CHx]   = cur_m;
+                                    dm_auto_paused[CHx]   = 0u;
                                 }
                                 else if (ks != 2u)
                                 {
@@ -1371,6 +1380,7 @@ public:
                                     dm_auto_try[CHx]      = 0u;
                                     dm_auto_remain_m[CHx] = bmcu_config_autoload_len(CHx);
                                     dm_auto_last_m[CHx]   = cur_m;
+                                    dm_auto_paused[CHx]   = 0u;
                                 }
                                 else if ((now_ms - dm_auto_t0_ms[CHx]) >= DM_AUTO_S1_TIMEOUT_MS)
                                 {
@@ -1457,6 +1467,16 @@ public:
 
                                     MC_STU_RGB_set(CHx, 0xFF, 0x00, 0x00);
                                 }
+                                else if (dm_auto_paused[CHx] == 0u &&
+                                         bmcu_config_autoload_len(CHx) > DM_AUTO_PAUSE_AFTER_M &&
+                                         (bmcu_config_autoload_len(CHx) - dm_auto_remain_m[CHx]) >=
+                                             DM_AUTO_PAUSE_AFTER_M)
+                                {
+                                    dm_auto_paused[CHx] = 1u;
+                                    dm_auto_state[CHx]  = DM_AUTO_S2_PAUSE;
+                                    dm_auto_t0_ms[CHx]  = now_ms;
+                                    dm_autoload_x = 0.0f;
+                                }
                                 else if (dm_auto_remain_m[CHx] <= 0.0f)
                                 {
                                     dm_loaded[CHx] = 1u;
@@ -1472,6 +1492,36 @@ public:
                                 else
                                 {
                                     dm_autoload_x = -dir * DM_AUTO_PWM_PUSH;
+                                }
+                                break;
+
+                            case DM_AUTO_S2_PAUSE:
+                                // Motor off; the rest of the autoload follows after the wait.
+                                dm_autoload_active = true;
+                                dm_autoload_x = 0.0f;
+                                MC_STU_RGB_set(CHx, 0xFF, 0xFF, 0x00);
+
+                                if (ks != 1u)
+                                {
+                                    if (ks == 2u)
+                                    {
+                                        dm_auto_state[CHx] = DM_AUTO_S1_DEBOUNCE;
+                                        dm_auto_t0_ms[CHx] = now_ms;
+                                    }
+                                    else
+                                    {
+                                        dm_auto_state[CHx]    = DM_AUTO_IDLE;
+                                        dm_auto_try[CHx]      = 0u;
+                                        dm_auto_remain_m[CHx] = 0.0f;
+                                        dm_auto_t0_ms[CHx]    = 0ull;
+                                    }
+                                    break;
+                                }
+                                if ((now_ms - dm_auto_t0_ms[CHx]) >= DM_AUTO_PAUSE_MS)
+                                {
+                                    dm_auto_last_m[CHx] = cur_m;   // ignore drift while stopped
+                                    dm_auto_state[CHx]  = DM_AUTO_S2_PUSH;
+                                    dm_auto_t0_ms[CHx]  = 0ull;
                                 }
                                 break;
 

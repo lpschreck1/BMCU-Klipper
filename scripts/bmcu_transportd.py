@@ -100,6 +100,10 @@ class TransportDaemon(object):
         self.latest_status_dict = None
         self.last_semantic_status = None
         self.status_file_due = 0.0
+        self.serial_opened_at = 0.0
+        self.hello_attempts = 0
+        self.rx_packets = 0
+        self.last_waiting_log = 0.0
 
     def setup(self):
         for path in (self.args.socket, self.args.socket + '.ctl', self.args.status_file):
@@ -220,6 +224,9 @@ class TransportDaemon(object):
             'generation': int(self.serial_generation),
             'session_id': int(self.session_id),
             'updated_at': time.time(),
+            'handshake_phase': self.handshake_phase,
+            'hello_attempts': int(self.hello_attempts),
+            'rx_packets': int(self.rx_packets),
             'status': self.latest_status_dict,
         }
 
@@ -566,6 +573,10 @@ class TransportDaemon(object):
             self.last_serial_rx = now
             self.last_serial_tx = now
             self.serial_settle_until = now + self.args.connect_settle
+            self.serial_opened_at = now
+            self.hello_attempts = 0
+            self.rx_packets = 0
+            self.last_waiting_log = now
             self.handshake_started_at = self.serial_settle_until
             self.next_handshake_action = self.serial_settle_until
             logging.info('opened %s for %s', port, self.args.name)
@@ -614,6 +625,9 @@ class TransportDaemon(object):
             logging.warning('serial offline: %s', reason)
             self._queue_link(False, reason)
 
+    def _not_ready_limit(self):
+        return max(60.0, 4.0 * float(self.args.connection_timeout))
+
     def _start_handshake(self):
         for cmd_id, purpose in list(self.internal_pending.items()):
             if purpose in ('hello', 'confirm'):
@@ -622,10 +636,14 @@ class TransportDaemon(object):
         self._queue_internal(
             protocol.MSG_HELLO, struct.pack('<I', nonce), 'hello')
         self.hello_sent = True
+        self.hello_attempts += 1
         self.handshake_phase = 'wait_hello'
         self.next_handshake_action = time.monotonic() + 0.60
 
     def _finish_ready(self):
+        logging.info('BMCU session ready on %s (uid %s, session %d) after %d HELLO attempt(s), %.1f s',
+                     self.current_port, self.runtime_uid, self.session_id,
+                     self.hello_attempts, time.monotonic() - self.serial_opened_at)
         self.session_ready = True
         self.handshake_phase = 'ready'
         self.handshake_started_at = 0.0
@@ -788,6 +806,7 @@ class TransportDaemon(object):
 
     def _handle_serial_packet(self, msg_type, seq, cmd_id, payload):
         self.last_serial_rx = time.monotonic()
+        self.rx_packets += 1
         purpose = self.internal_pending.get(cmd_id)
         if purpose == 'hello' and msg_type == protocol.MSG_HELLO_ACK:
             hello = protocol.parse_hello(payload)
@@ -1028,6 +1047,23 @@ class TransportDaemon(object):
                 self.last_connect_error = error
         if self.serial is not None:
             if not self.session_ready:
+                waited = now - self.serial_opened_at
+                if self.serial_opened_at and waited >= self._not_ready_limit():
+                    # Backstop for any path that keeps the handshake timeout from
+                    # firing: never sit on an open port without a session.
+                    self._close_serial(
+                        'no BMCU session %.0f s after opening the port (phase %s, '
+                        '%d HELLO attempt(s), %d packet(s) received)' % (
+                            waited, self.handshake_phase, self.hello_attempts,
+                            self.rx_packets))
+                    return
+                if now - self.last_waiting_log >= 30.0:
+                    self.last_waiting_log = now
+                    logging.info(
+                        'still waiting for a BMCU session on %s: phase %s, %d HELLO '
+                        'attempt(s), %d packet(s) received, %.0f s since open',
+                        self.current_port, self.handshake_phase, self.hello_attempts,
+                        self.rx_packets, waited)
                 if (now >= self.serial_settle_until and
                         self.handshake_started_at and
                         now - self.handshake_started_at >= self.args.connection_timeout):

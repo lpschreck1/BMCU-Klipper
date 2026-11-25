@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from . import compat, protocol, presets, transport
 from .release import PACKAGE_VERSION
 from .device import BMCUDevice
-from .endpoints import (create_endpoint, normalize_u1_material_name,
+from .endpoints import (SnapmakerU1Endpoint, create_endpoint, normalize_u1_material_name,
                         u1_tip_profile_defaults,
                         u1_tip_snapmaker_movement_defaults,
                         validate_u1_tip_profile)
@@ -311,6 +311,9 @@ class BMCUManager(object):
         self._u1_planner_last_scan_ms = 0.0
         self._u1_pending_temperature_profile = None
         self._u1_background_jobs = {}
+        # Set only while a background job checks and releases its own Head: its own
+        # channel locks and job entry are then not counted as BMCU ownership.
+        self._u1_ownership_self_job = None
         self._u1_toolchange_resume_pending = {}
         self.last_error = None
         self.last_diagnostic = None
@@ -377,6 +380,9 @@ class BMCUManager(object):
         self._manual_refill_resume_original = None
         self._manual_refill_resume_wrapped = False
         self._u1_replenish_wrapped = False
+        self._u1_stock_feed_original = None
+        self._u1_stock_feed_wrapped = False
+        self._u1_stock_feed_inner = False
         self._u1_cancel_ui_context = False
         self._u1_cancel_requested = False
         self._critical_g28_original = None
@@ -1034,7 +1040,7 @@ class BMCUManager(object):
                 millimeters = 120.0
             if not math.isfinite(millimeters):
                 millimeters = 120.0
-            values.append(max(10.0, min(1000.0, millimeters)) / 1000.0)
+            values.append(max(10.0, min(2000.0, millimeters)) / 1000.0)
         return values
 
     @staticmethod
@@ -1082,7 +1088,7 @@ class BMCUManager(object):
             value = 120.0
         if not math.isfinite(value):
             value = 120.0
-        return max(10.0, min(1000.0, value))
+        return max(10.0, min(2000.0, value))
 
     @staticmethod
     def _lighting_config(device_state):
@@ -1501,6 +1507,7 @@ class BMCUManager(object):
             'BMCU_SET_OUTPUT': self.cmd_SET_OUTPUT,
             'BMCU_SET_ROUTE': self.cmd_SET_OUTPUT,
             'BMCU_SNAP_FEEDER': self.cmd_SNAP_FEEDER,
+            'BMCU_SET_PRELOAD': self.cmd_SET_PRELOAD,
             'BMCU_MAP_TOOL': self.cmd_MAP_TOOL,
             'BMCU_SET_TOOL': self.cmd_SET_TOOL,
             'BMCU_LOAD': self.cmd_LOAD,
@@ -1618,6 +1625,7 @@ class BMCUManager(object):
             raise gcmd.error('printer RESUME handler is unavailable')
         pending = getattr(self.refill, 'manual_pending', None)
         if not isinstance(pending, dict):
+            self._prepare_u1_resume_projection()
             return original(gcmd)
         try:
             self.refill.resume_manual_refill(gcmd=gcmd)
@@ -1631,6 +1639,65 @@ class BMCUManager(object):
             raise gcmd.error(
                 'BMCU manual refill is not ready: %s' % str(exc))
         return original(gcmd)
+
+    def _u1_resume_route(self, endpoint):
+        """The BMCU route a paused Head should hold when the print resumes: the one
+        loaded there, else the tool change that was in progress for it, else the
+        Head's next planned BMCU tool. None when the Head's next source is not BMCU."""
+        loaded = self._loaded_devices_for_endpoint(endpoint.name)
+        if loaded:
+            return loaded[0]
+        tools = []
+        cursor = getattr(self, '_u1_toolchange_cursor', -1)
+        plan = getattr(self, '_u1_toolchange_plan', []) or []
+        if isinstance(cursor, int) and 0 <= cursor < len(plan):
+            tools.append(plan[cursor].get('tool', -1))
+        route = self._first_u1_route_for_endpoint(endpoint.name)
+        if route is not None:
+            tools.append(route.get('tool', -1))
+        for tool in tools:
+            try:
+                route = self._u1_logical_route(int(tool))
+            except (TypeError, ValueError):
+                continue
+            if (route is None or route.get('kind') != 'bmcu' or
+                    route.get('endpoint') is None or
+                    route['endpoint'].name != endpoint.name):
+                continue
+            device, channel, _target = self._resolve_tool(int(tool))
+            return device, channel
+        return None
+
+    def _prepare_u1_resume_projection(self):
+        """Before Snapmaker's RESUME runs its checks: give the paused Head the filament
+        info of the BMCU source it will hold. A failed BMCU load clears that info, and
+        Snapmaker then refuses every resume of that Head ("filament runout" /
+        "not edit filament") before BMCU gets a chance to load it again. Left alone
+        when the BMCU source itself has run out, so a real runout still stops."""
+        if not self.print_map_active or not self._snapmaker_platform():
+            return False
+        try:
+            macro = self.printer.lookup_object('gcode_macro INNER_RESUME', None)
+            head = int((getattr(macro, 'variables', {}) or {}).get('last_extruder_index', -1))
+            endpoint = self._u1_endpoint_for_head(head)
+            if endpoint is None or not self._assigned_routes_for_endpoint(endpoint.name):
+                return False
+            route = self._u1_resume_route(endpoint)
+            if route is None:
+                return False
+            device, channel = route
+            present = (getattr(device, 'status', {}) or {}).get('present') or []
+            if not (channel < len(present) and present[channel]):
+                logging.info('BMCU resume: %s Channel %d has no filament; leaving Head %d '
+                             'to the runout handling', device.name, channel + 1, head + 1)
+                return False
+            endpoint.sync_active_filament(self._channel_metadata(device, channel))
+            logging.info('BMCU resume: Head %d filament info set from %s Channel %d so '
+                         'the printer can resume it', head + 1, device.name, channel + 1)
+            return True
+        except Exception:
+            logging.exception('BMCU could not prepare the paused Head for resume')
+            return False
 
     def _handle_u1_cancel_ui_context(self, *args):
 
@@ -1684,6 +1751,134 @@ class BMCUManager(object):
             self._cmd_u1_replenish_wrapper)
         self._u1_replenish_wrapped = True
         return True
+
+    def _install_u1_stock_feed_wrapper(self):
+        """Wrap Snapmaker's print-start SM_PRINT_AUTO_FEED so a print without a BMCU
+        plan (sliced with Snapmaker's own profile) can use a head's stock feeder even
+        when BMCU filament was left in that head."""
+        if self._u1_stock_feed_wrapped:
+            return True
+        handlers = getattr(self.gcode, 'ready_gcode_handlers', None)
+        original = (handlers.get('SM_PRINT_AUTO_FEED')
+                    if isinstance(handlers, dict) else None)
+        if original is None:
+            logging.info('BMCU: SM_PRINT_AUTO_FEED not found; stock-print unload hook not installed')
+            return False
+        removed = self.gcode.register_command('SM_PRINT_AUTO_FEED', None)
+        if removed is None:
+            self._record_error(
+                'U1_STOCK_FEED_HOOK_UNAVAILABLE',
+                details='stock SM_PRINT_AUTO_FEED could not be detached safely')
+            return False
+        self._u1_stock_feed_original = removed
+        self.gcode.register_command('SM_PRINT_AUTO_FEED', self._cmd_u1_stock_feed_wrapper)
+        self._u1_stock_feed_wrapped = True
+        return True
+
+    def _cmd_u1_stock_feed_wrapper(self, gcmd):
+        original = self._u1_stock_feed_original
+        if original is None:
+            raise gcmd.error('stock SM_PRINT_AUTO_FEED handler is unavailable')
+        if self._u1_resume_feed_runs_pending_recovery(gcmd):
+            return None
+        endpoint = self._u1_stock_print_endpoint(gcmd)
+        if endpoint is not None:
+            try:
+                self._prepare_u1_head_for_stock_print(endpoint, gcmd)
+                endpoint.prepare_native_stock_load(printing=True)
+            except Exception as exc:
+                self._record_error(
+                    'U1_STOCK_PRINT_PREPARE_FAILED', endpoint=endpoint.name,
+                    phase='AUTO_FEED', details=str(exc))
+                raise self._command_pause_error(gcmd, exc)
+        self._u1_stock_feed_inner = True
+        try:
+            return original(gcmd)
+        finally:
+            self._u1_stock_feed_inner = False
+
+    def _u1_resume_feed_runs_pending_recovery(self, gcmd):
+        """Resuming a print whose BMCU load failed at print start: Snapmaker's resume
+        reloads the paused Head with SM_PRINT_AUTO_FEED, not with the tool change the
+        recovery was armed for. Run the recovery here, so it can't be left pending to
+        block a later tool change."""
+        pending = getattr(self, '_u1_toolchange_resume_pending', None)
+        if (self._u1_stock_feed_inner or not self.print_map_active or
+                not isinstance(pending, dict) or not pending):
+            return False
+        try:
+            head = int(gcmd.get_int('EXTRUDER', -1))
+        except Exception:
+            return False
+        endpoint = self._u1_endpoint_for_head(head)
+        if endpoint is None or endpoint.name != pending.get('endpoint'):
+            return False
+        try:
+            return bool(self._run_pending_u1_recovery(gcmd))
+        except Exception as exc:
+            self._record_error('U1_RESUME_RECOVERY_FAILED', endpoint=endpoint.name,
+                               phase='RESUME', details=str(exc))
+            raise self._command_pause_error(gcmd, exc)
+
+    def _u1_stock_print_endpoint(self, gcmd):
+        """The Head this SM_PRINT_AUTO_FEED loads, when it needs BMCU's attention: a
+        print with no BMCU plan that uses a Head with BMCU Channels. None otherwise
+        (BMCU's own calls, BMCU-plan prints, unused or BMCU-free Heads)."""
+        if (self._u1_stock_feed_inner or self.print_map_active or
+                self.controller_mode != 'standalone'):
+            return None
+        try:
+            head = int(gcmd.get_int('EXTRUDER', -1))
+        except Exception:
+            return None
+        if head < 0 or head > 3:
+            return None
+        _task, task_config = self._u1_task_config()
+        used = (task_config or {}).get('extruders_used', [])
+        if not (isinstance(used, list) and len(used) > head and used[head]):
+            return None
+        endpoint = self._u1_endpoint_for_head(head)
+        if endpoint is None or not self._assigned_routes_for_endpoint(endpoint.name):
+            return None
+        return endpoint
+
+    def _prepare_u1_head_for_stock_print(self, endpoint, gcmd):
+        """Clear BMCU filament from a Head a stock print uses and hand the Head
+        back to its stock feeder, so Snapmaker's own load can run."""
+        head = int(endpoint.get('head_index', -1)) + 1
+        loaded = self._loaded_devices_for_endpoint(endpoint.name)
+        if len(loaded) > 1:
+            raise BMCUError('multiple BMCU routes are loaded into Head %d' % head)
+        if loaded:
+            device, channel = loaded[0]
+            channel = int(channel)
+            if self._snapmaker_ungripped_tail(device, channel, endpoint):
+                raise BMCUError(
+                    'Head %d has a detached BMCU filament tail; unload it in the BMCU '
+                    'panel before a stock print' % head)
+            gcmd.respond_info(
+                'BMCU: this print uses Head %d\'s stock feeder; unloading %s Channel %d '
+                'from Head %d first' % (head, device.name, channel + 1, head))
+            self._lock(device, endpoint, 'STOCK PRINT UNLOAD', channel=channel)
+            try:
+                self._validate_endpoint_for_operation(endpoint)
+                self._unload_locked(
+                    device, endpoint, channel, release_endpoint=False,
+                    reconcile_requires_park=False,
+                    temperature_profile=self._u1_active_temperature_profile())
+            finally:
+                self._unlock(device, endpoint)
+        owner = self._u1_owner_status(endpoint)
+        if owner.get('owner') not in ('native', 'native_busy'):
+            if not self._release_u1_persistent_hold_if_safe(
+                    endpoint, 'stock print uses Head %d' % head,
+                    close_generation=True, allow_stock_path=True):
+                raise BMCUError(
+                    "Head %d couldn't be handed back to its stock feeder (the BMCU-Klipper "
+                    'log says why); unload it in the BMCU panel and start again' % head)
+        if loaded:
+            gcmd.respond_info(
+                'BMCU: Head %d is back on its stock feeder for this print' % head)
 
     def _cmd_u1_replenish_wrapper(self, gcmd):
         original = self._u1_replenish_original
@@ -2108,6 +2303,8 @@ class BMCUManager(object):
         if is_u1:
             self._install_u1_cancel_wrapper()
             self._install_u1_replenish_wrapper()
+            self._install_u1_stock_feed_wrapper()
+            self._apply_u1_preload_lengths()
         if self._manual_refill_resume_needed():
             self._install_manual_refill_resume_wrapper()
         self._promote_critical_motion_handler()
@@ -2611,6 +2808,12 @@ class BMCUManager(object):
             for device in self.devices:
                 device.set_transport_paused(False)
                 device.tick(eventtime)
+
+            if (not self._u1_lease_dirty and
+                    eventtime >= getattr(self, '_u1_native_poll_at', 0.0)):
+                self._u1_native_poll_at = eventtime + 2.0
+                if self._u1_native_state_changed():
+                    self._u1_lease_dirty = True
 
             if (self._u1_lease_dirty and
                     self._print_state() not in ('printing', 'paused', 'pause') and
@@ -5750,6 +5953,72 @@ class BMCUManager(object):
                 raise
             return endpoint._native_feeder_status()
 
+    def _u1_native_tool_can_take_over(self, endpoint, owner=None):
+        """A print may plan a Head's stock feeder while BMCU filament is in that Head:
+        the tool change to the stock feeder unloads the BMCU route and hands the
+        Head back (_activate_native_u1_route). Allowed only when BMCU simply holds
+        the Head (no work in flight, no safety hold, no disconnect hazard) and the
+        stock path itself reads clear, so the hand-back can't be refused later."""
+        return self._u1_native_take_over_refusal(endpoint, owner) is None
+
+    def _u1_native_take_over_refusal(self, endpoint, owner=None):
+        """None when the take-over is allowed, otherwise the reason it is not."""
+        owner = owner if isinstance(owner, dict) else self._u1_owner_status(endpoint)
+        if owner.get('owner') != 'bmcu':
+            return 'owner is %s' % (owner.get('owner') or 'unknown')
+        self._refresh_u1_disconnect_hazards(endpoint.name)
+        if self._u1_disconnect_hazards.get(endpoint.name):
+            return 'a BMCU disconnect hazard is open on this Head'
+        loaded = len(self._loaded_devices_for_endpoint(endpoint.name))
+        if loaded > 1:
+            return '%d BMCU routes are loaded on this Head' % loaded
+        try:
+            path = endpoint.native_path_status()
+        except Exception as exc:
+            return 'the stock path state could not be read (%s)' % exc
+        if path.get('known') is not True:
+            return 'the stock path state is unknown'
+        state = path.get('channel_state') or 'none'
+        if path.get('busy') is not False:
+            if state == 'preload_finish' and not path.get('preload_clear'):
+                return ("the stock filament is preloaded (preload_finish) and "
+                        "SNAP_PRELOAD_CLEAR is off for this Head, so it counts as "
+                        "occupying the shared path")
+            return 'the stock path is occupied (%s)' % state
+        if path.get('feeder_input_detected') is not True:
+            return 'no filament is detected at the stock feeder input (%s)' % state
+        return None
+
+    def _u1_native_state_changed(self):
+        """True when a Head's stock feeder changed state (loaded, unloaded,
+        preloaded, input in or out) since its lease was last worked out. Nothing
+        else marks the lease stale for those, so the panel kept showing a stock
+        unload or preload as "native filament is loaded" until something unrelated
+        refreshed it."""
+        for endpoint in tuple(self.endpoints.values()):
+            if getattr(endpoint, 'driver', None) != 'snapmaker_u1':
+                continue
+            lease = self._u1_lease_state.get(endpoint.name)
+            path = lease.get('path') if isinstance(lease, dict) else None
+            if not isinstance(path, dict) or not path.get('known'):
+                continue
+            try:
+                feeder = self._u1_native_feeder_status(endpoint)
+            except Exception:
+                continue
+            if not isinstance(feeder, dict):
+                continue
+            now_state = str(feeder.get('channel_state', '') or '').strip().lower() or 'none'
+            was_state = str(path.get('channel_state', '') or '').strip().lower() or 'none'
+            if now_state != was_state:
+                return True
+            now_input = feeder.get('filament_detected')
+            was_input = path.get('feeder_input_detected')
+            if (now_input is not None and was_input is not None and
+                    bool(now_input) != bool(was_input)):
+                return True
+        return False
+
     def _u1_ownership_record(self, endpoint_name):
         records = self.state.data.setdefault('u1_ownership', {})
         record = records.get(endpoint_name)
@@ -5957,7 +6226,8 @@ class BMCUManager(object):
                               save=False, close_generation=False,
                               auto=None, require_restore=False,
                               allow_unverified_devices=None,
-                              allow_settled_native_path=False):
+                              allow_settled_native_path=False,
+                              allow_stock_path=False):
 
         if endpoint is None or endpoint.driver != 'snapmaker_u1':
             return False
@@ -5998,6 +6268,10 @@ class BMCUManager(object):
             path_safe = bool(path.get('known') and not path.get('busy'))
             if (allow_settled_native_path and
                     self._u1_uninstall_native_path_settled(path)):
+                path_safe = True
+            if allow_stock_path and path.get('known'):
+                # handing the Head to a stock print: the occupied stock path is
+                # that print's own stock filament
                 path_safe = True
             if not path_safe:
                 raise BMCUError(
@@ -6473,30 +6747,72 @@ class BMCUManager(object):
         return record
 
     def _release_u1_persistent_hold_if_safe(self, endpoint, reason='path empty',
-                                                   close_generation=False):
+                                                   close_generation=False,
+                                                   ignore_job=None,
+                                                   allow_stock_path=False):
+        """Hand a U1 Head back to its stock feeder when that is safe. Each refusal is
+        logged with its reason. ignore_job: a background job releasing its own Head,
+        whose own channel locks and job entry don't count as BMCU ownership.
+        allow_stock_path: the Head goes to a stock print, so stock filament occupying
+        the stock path is that print's own filament, not a reason to refuse."""
         if endpoint is None or endpoint.driver != 'snapmaker_u1':
             return False
         record = self._u1_ownership_record(endpoint.name)
         if not (record.get('persistent_hold') or
                 record.get('native_auto_override_active')):
+            # nothing is held: not a refusal, so not logged
             return False
+        previous = self._u1_ownership_self_job
+        self._u1_ownership_self_job = ignore_job
+        try:
+            why = self._u1_release_refusal(endpoint, allow_stock_path=allow_stock_path)
+            if why:
+                logging.info(
+                    'BMCU kept %s from the stock feeder (%s): %s',
+                    endpoint.name, reason, why)
+                return False
+            return self._handoff_u1_to_native(
+                endpoint, reason=reason, save=True,
+                close_generation=close_generation,
+                allow_stock_path=allow_stock_path)
+        finally:
+            self._u1_ownership_self_job = previous
+
+    def _u1_release_refusal(self, endpoint, allow_stock_path=False):
+        """Why a held U1 Head can't go back to its stock feeder now ('' if it can)."""
         if self._endpoint_has_loaded_or_active_route(endpoint.name):
-            return False
+            busy = [
+                '%s Channel %d %s' % (
+                    getattr(item.get('device'), 'name', item.get('device')),
+                    int(item.get('channel', -1)) + 1,
+                    'in flight' if item.get('inflight') else
+                    'durably loaded' if item.get('durable_loaded') else
+                    'route %s' % item.get('raw_state'))
+                for item in self._u1_endpoint_ownership_evidence(endpoint.name)
+                if (item.get('inflight') or item.get('durable_loaded') or
+                    item.get('raw_state') != protocol.ROUTE_EMPTY)]
+            return 'a BMCU route is loaded or active%s' % (
+                ' (%s)' % ', '.join(busy) if busy else
+                ' (prestage, detached tail or pending follower)')
         self._refresh_u1_disconnect_hazards(endpoint.name)
-        if self._u1_disconnect_hazards.get(endpoint.name):
-            return False
+        hazards = self._u1_disconnect_hazards.get(endpoint.name)
+        if hazards:
+            return 'safety hazard: %s' % self._u1_disconnect_hazard_reason(
+                endpoint.name, hazards)
         assigned = self._assigned_routes_for_endpoint(endpoint.name)
-        unverified = [
+        unverified = sorted({
             device.name for device, _channel in assigned
-            if device.name not in self._u1_devices_reconciled_once]
+            if device.name not in self._u1_devices_reconciled_once})
         if unverified:
-            return False
+            return 'BMCU module(s) not verified since start: %s' % ', '.join(unverified)
         path = endpoint.native_path_status()
-        if not path.get('known') or path.get('busy'):
-            return False
-        return self._handoff_u1_to_native(
-            endpoint, reason=reason, save=True,
-            close_generation=close_generation)
+        if not path.get('known'):
+            return 'stock feeder state is unknown'
+        if path.get('busy') and not allow_stock_path:
+            return 'stock path occupied (feeder state %s, input %s)' % (
+                path.get('channel_state') or '?',
+                'detected' if path.get('feeder_input_detected') else 'clear')
+        return ''
 
     def _ensure_u1_takeover(self, endpoint, save=False):
         try:
@@ -6784,7 +7100,9 @@ class BMCUManager(object):
         elif (ownership.get('persistent_hold') or
               ownership.get('native_auto_override_active') or
               any(item['claimed'] for item in evidence) or
-              endpoint.name in getattr(self, '_u1_background_jobs', {})):
+              (endpoint.name in getattr(self, '_u1_background_jobs', {}) and
+               getattr(self, '_u1_background_jobs', {}).get(endpoint.name) is not
+               getattr(self, '_u1_ownership_self_job', None))):
             busy = any(
                 item['raw_state'] == protocol.ROUTE_UNCERTAIN or
                 item['inflight'] for item in evidence)
@@ -7395,7 +7713,9 @@ class BMCUManager(object):
             operation_active = bool(
                 endpoint_name in operation_endpoints and
                 operation_channel in (-1, channel, 0xff))
-        if (device.name, channel) in self._u1_background_channel_locks:
+        lock_job = self._u1_background_channel_locks.get((device.name, channel))
+        if (lock_job is not None and
+                lock_job is not getattr(self, '_u1_ownership_self_job', None)):
             operation_active = True
 
         ownership = self.state.data.get('u1_ownership', {}).get(
@@ -9637,8 +9957,13 @@ class BMCUManager(object):
             str(before.get('channel_state', '')).lower() == 'load_finish')
         with self.printer_critical_section(
                 'snapmaker_u1_stock_auto_feed'):
-            self.gcode.run_script_from_command(
-                'SM_PRINT_AUTO_FEED EXTRUDER=%d' % int(head))
+            previous_inner = self._u1_stock_feed_inner
+            self._u1_stock_feed_inner = True
+            try:
+                self.gcode.run_script_from_command(
+                    'SM_PRINT_AUTO_FEED EXTRUDER=%d' % int(head))
+            finally:
+                self._u1_stock_feed_inner = previous_inner
             after = endpoint.native_path_status()
         after_loaded = bool(
             after.get('known') and
@@ -10508,14 +10833,17 @@ class BMCUManager(object):
                         'BMCU Snapmaker background prepared native T%d follower '
                         'handoff on %s', target_tool, endpoint.name)
                 else:
+                    # Release ignoring this job's own channel locks and job entry.
+                    # If it's still refused (the reason is logged), the foreground
+                    # tool change retries after consuming this job.
                     if not self._release_u1_persistent_hold_if_safe(
                             endpoint,
                             'background unload prepared the native source',
-                            close_generation=True):
-                        owner = self._u1_owner_status(endpoint)
-                        if owner.get('owner') not in ('native', 'native_busy'):
-                            raise BMCUError(
-                                'native feeder ownership was not restored after background unload')
+                            close_generation=True, ignore_job=job):
+                        job['native_release_deferred'] = True
+                        logging.info(
+                            'BMCU Snapmaker native feeder release on %s deferred '
+                            'to the T%d tool change', endpoint.name, target_tool)
                     job['state'] = 'ready_native'
                     job['phase'] = 'READY_NATIVE'
                     logging.info(
@@ -11948,6 +12276,11 @@ class BMCUManager(object):
             endpoint, require_u1_ownership=False)
         self._reconcile_u1_pending_follower_commit(endpoint)
         self._reconcile_generic_pending_follower_commit(endpoint)
+        if self._u1_should_identify_before_load(endpoint, prefetched_u1_target):
+            # Filament nobody accounts for at the Head (a failed or interrupted
+            # load, a manual change): identify it instead of loading on top of it.
+            self._identify_u1_head_filament(
+                endpoint, int(endpoint.get('head_index', -1)), gcmd)
         occupied = self._loaded_devices_for_endpoint(
             endpoint.name, excluded_route=route_key)
         if len(occupied) > 1:
@@ -14297,7 +14630,7 @@ class BMCUManager(object):
         unload_retract_mm = self._finite_gcmd_float(
             gcmd, 'UNLOAD_RETRACT_MM', None, minval=10.0, maxval=2000.0)
         autoload_mm = self._finite_gcmd_float(
-            gcmd, 'AUTOLOAD_MM', None, minval=10.0, maxval=1000.0)
+            gcmd, 'AUTOLOAD_MM', None, minval=10.0, maxval=2000.0)
         logical_tool = gcmd.get_int(
             'TOOL', None, minval=GENERIC_BMCU_TOOL_MIN,
             maxval=GENERIC_LOGICAL_TOOL_LIMIT - 1)
@@ -14719,6 +15052,7 @@ class BMCUManager(object):
             ('NATIVE_FILAMENT_MANAGER', 'native_filament_manager'),
             ('SNAP_FEEDER_TAKEOVER', 'u1_native_feeder_takeover'),
             ('SNAP_REQUIRE_FEEDER_CONFIRMATION', 'u1_require_feeder_confirmation'),
+            ('SNAP_PRELOAD_CLEAR', 'u1_preload_clear'),
             ('AUTO_REFILL', 'auto_refill_enabled'),
             ('TAIL_RUNOUT', 'tail_runout_enabled'),
             ('SNAP_SENSOR_TAKEOVER', 'u1_sensor_takeover'),
@@ -14869,6 +15203,100 @@ class BMCUManager(object):
         gcmd.respond_info(json.dumps(result, indent=2, sort_keys=True))
         if bool(gcmd.get_int('STRICT', 0, minval=0, maxval=1)) and not result['ok']:
             raise gcmd.error('Snapmaker U1 integration check failed for %s' % endpoint_name)
+
+    def _u1_side_endpoints(self, module):
+        result = []
+        for endpoint in tuple(self.endpoints.values()):
+            if getattr(endpoint, 'driver', None) != 'snapmaker_u1':
+                continue
+            try:
+                if endpoint.native_feeder_target()[0] == module:
+                    result.append(endpoint)
+            except Exception:
+                continue
+        return sorted(result, key=lambda endpoint: endpoint._head())
+
+    def _apply_u1_preload_lengths(self):
+        """Put BMCU's saved preload length on Snapmaker's feeder modules. Snapmaker
+        reads preload_length once at startup, so this is re-applied on every start
+        and survives a firmware update rewriting printer.cfg."""
+        applied = {}
+        for module in ('left', 'right'):
+            endpoints = self._u1_side_endpoints(module)
+            if not endpoints:
+                continue
+            feeder = self.printer.lookup_object('filament_feed %s' % module, None)
+            heads = ' and '.join(str(endpoint._head() + 1) for endpoint in endpoints)
+            length = max(endpoint.preload_length_setting() for endpoint in endpoints)
+            if feeder is None or not hasattr(feeder, '_feed_preload_counts'):
+                if length > 0.0:
+                    logging.warning(
+                        'BMCU could not set the %s feeder preload length (Heads %s): this '
+                        'Snapmaker firmware has no _feed_preload_counts; printer.cfg applies',
+                        module, heads)
+                continue
+            if not hasattr(feeder, '_bmcu_printer_cfg_preload_counts'):
+                feeder._bmcu_printer_cfg_preload_counts = int(feeder._feed_preload_counts)
+            if length > 0.0:
+                circumference = endpoints[0]._feeder_wheel_circumference(feeder)
+                counts = int(length / circumference * 2)
+            else:
+                counts = int(feeder._bmcu_printer_cfg_preload_counts)
+            if int(feeder._feed_preload_counts) != counts:
+                feeder._feed_preload_counts = counts
+                logging.info(
+                    'BMCU set the %s feeder preload length (Heads %s) to %s', module, heads,
+                    '%.0f mm' % length if length > 0.0 else "printer.cfg's value")
+            applied[module] = length
+        return applied
+
+    def cmd_SET_PRELOAD(self, gcmd):
+        """BMCU_SET_PRELOAD SIDE=left|right (or HEAD=1-4) LENGTH=<mm>; LENGTH=0 goes
+        back to Snapmaker's printer.cfg value. Applies to both Heads on that feeder."""
+        side = str(gcmd.get('SIDE', '') or '').strip().lower()
+        head = gcmd.get_int('HEAD', 0, minval=0, maxval=16)
+        if not side and head:
+            for endpoint in tuple(self.endpoints.values()):
+                if (getattr(endpoint, 'driver', None) == 'snapmaker_u1' and
+                        endpoint._head() == head - 1):
+                    side = endpoint.native_feeder_target()[0]
+                    break
+        if side not in ('left', 'right'):
+            raise gcmd.error('BMCU_SET_PRELOAD needs SIDE=left or SIDE=right (or HEAD=1-4)')
+        length = gcmd.get_float('LENGTH', minval=0.0, maxval=1500.0)
+        low = SnapmakerU1Endpoint.PRELOAD_LENGTH_MIN_MM
+        if 0.0 < length < low:
+            raise gcmd.error('preload length must be 0 (printer.cfg) or %.0f-1500 mm' % low)
+        targets = self._u1_side_endpoints(side)
+        if not targets:
+            raise gcmd.error('no Snapmaker U1 Head uses the %s feeder' % side)
+        previous = {}
+        for endpoint in targets:
+            previous[endpoint.name] = endpoint.config.get('u1_preload_length', 0.0)
+            endpoint.config['u1_preload_length'] = float(length)
+            self.state.data['endpoints'][endpoint.name]['u1_preload_length'] = float(length)
+        try:
+            self.state.save()
+        except Exception:
+            for endpoint in targets:
+                endpoint.config['u1_preload_length'] = previous[endpoint.name]
+                self.state.data['endpoints'][endpoint.name]['u1_preload_length'] = \
+                    previous[endpoint.name]
+            raise
+        self._apply_u1_preload_lengths()
+        status = targets[0].native_preload_status()
+        heads = ' and '.join(str(endpoint._head() + 1) for endpoint in targets)
+        if not status['supported']:
+            gcmd.respond_info(
+                'BMCU saved the %s feeder preload length, but this Snapmaker firmware '
+                "doesn't expose it; printer.cfg still applies" % side)
+        elif length > 0.0:
+            gcmd.respond_info('BMCU %s feeder (Heads %s) preload length: %.0f mm' %
+                              (side, heads, length))
+        else:
+            gcmd.respond_info("BMCU %s feeder (Heads %s) preload length: printer.cfg's "
+                              'value (about %.0f mm)' % (side, heads, status['printer_cfg_mm']))
+        self._sync_status_cache_runtime()
 
     def cmd_SNAP_FEEDER(self, gcmd):
         self._require_standalone_operation('BMCU_SNAP_FEEDER', gcmd)
@@ -15280,6 +15708,10 @@ class BMCUManager(object):
                 detached_source[0], detached_source[1], endpoint,
                 logical_tool=int(route['tool']))
         else:
+            # A finished background unload keeps its channel locks and makes the
+            # Head report BMCU ownership until it is consumed; consume it first so
+            # the ownership check and release below see the real route state.
+            self._consume_u1_background_route(route)
             owner = self._u1_owner_status(endpoint)
             if owner.get('owner') not in ('native', 'native_busy'):
                 released = self._release_u1_persistent_hold_if_safe(
@@ -15297,6 +15729,10 @@ class BMCUManager(object):
                 endpoint.native_feeder_load(printing=True)
                 self._mark_u1_head_prepared(
                     endpoint.get('head_index', -1), source='stock native feeder')
+                # Snapmaker's load just flushed this head (INNER_FLUSH_FILAMENT), so
+                # skip the slicer's pre-extrude that follows, as after a BMCU load.
+                self._u1_preextrude_primed_tools[int(route['tool'])] = (
+                    self.reactor.monotonic())
         self._activate_u1_logical_tool(int(route['tool']), endpoint)
         self._consume_u1_background_route(route)
         return True
@@ -15357,6 +15793,31 @@ class BMCUManager(object):
                 'BMCU selected generic External T0; manual filament is not tracked')
         return True
 
+    def _u1_pending_recovery_is_for(self, tool):
+        pending = self._u1_toolchange_resume_pending
+        return isinstance(pending, dict) and int(pending.get('tool', -1)) == int(tool)
+
+    def _u1_pending_recovery_shares_head(self, tool):
+        pending = self._u1_toolchange_resume_pending
+        if not isinstance(pending, dict) or not pending:
+            return False
+        route = self._u1_logical_route(int(tool))
+        endpoint = route.get('endpoint') if isinstance(route, dict) else None
+        return endpoint is not None and endpoint.name == pending.get('endpoint')
+
+    def _run_pending_u1_recovery(self, gcmd=None):
+        """Run the pending BEFORE_ON_USE recovery for its own tool, from wherever the
+        print next needs that Head (another tool change on it, or the reload when
+        the print resumes)."""
+        pending = self._u1_toolchange_resume_pending
+        if not isinstance(pending, dict) or not pending:
+            return False
+        tool = int(pending.get('tool', -1))
+        logging.info('BMCU running the pending T%d recovery on %s', tool,
+                     pending.get('endpoint'))
+        return self._resume_u1_toolchange_before_on_use(
+            tool, -1, self._u1_temperature_profile(tool=tool), gcmd=gcmd)
+
     def _resume_u1_toolchange_before_on_use(
             self, tool, plan_index, temperature_profile, gcmd=None):
         pending = self._u1_toolchange_resume_pending
@@ -15396,6 +15857,16 @@ class BMCUManager(object):
             if expected_route not in (
                     protocol.ROUTE_UNCERTAIN, protocol.ROUTE_LOADED):
                 raise BMCUError('invalid U1 toolchange recovery route state')
+            if (route_state == protocol.ROUTE_LOADED and
+                    expected_route == protocol.ROUTE_UNCERTAIN):
+                # Another path (the reload when the print resumed) already
+                # completed this load; the recovery has nothing left to do.
+                logging.info(
+                    'BMCU dropped the pending T%d recovery: %s Channel %d is '
+                    'already LOADED', int(tool), device.name, channel + 1)
+                self._u1_toolchange_resume_pending.clear()
+                load_temperature_finalized = True    # nothing was heated here
+                return False
             if route_state != expected_route:
                 raise BMCUError(
                     '%s Channel %d recovery expected %s route, got %s' %
@@ -15518,10 +15989,16 @@ class BMCUManager(object):
                 if is_snapmaker else -1
             temperature_profile = (self._u1_temperature_profile(
                 plan_index, tool=tool) if is_snapmaker else None)
-            if (is_snapmaker and self._u1_toolchange_resume_pending and
-                    self._resume_u1_toolchange_before_on_use(
-                        tool, plan_index, temperature_profile, gcmd=gcmd)):
-                return
+            if is_snapmaker and self._u1_toolchange_resume_pending:
+                if self._u1_pending_recovery_is_for(tool):
+                    if self._resume_u1_toolchange_before_on_use(
+                            tool, plan_index, temperature_profile, gcmd=gcmd):
+                        return
+                elif self._u1_pending_recovery_shares_head(tool):
+                    # Another tool on the Head with the pending recovery: finish that
+                    # recovery first, then this tool change swaps it out normally.
+                    self._run_pending_u1_recovery(gcmd)
+                # A recovery on another Head waits for that Head's next use.
             target_route = self._u1_logical_route(tool) \
                 if is_snapmaker else None
             if is_snapmaker and target_route is not None:
@@ -15618,6 +16095,177 @@ class BMCUManager(object):
         gcmd.respond_info(
             'Snapmaker U1 BMCU cross-head refill resumed from durable journal')
 
+    # Print-start identification of filament found in a Head that BMCU has no
+    # record of (a Head left loaded through an interrupted or manual operation).
+    IDENTIFY_EXTRUDE_MM = 15.0
+    IDENTIFY_MOVED_MM = 6.0      # the channel feeding the Head moves about the extrusion
+    IDENTIFY_STILL_MM = 2.0      # every other channel stays below this
+
+    def _u1_unaccounted_head_filament(self, endpoint):
+        """True when the Head's entry sensor sees filament that neither a loaded
+        BMCU route nor a loaded stock feeder accounts for."""
+        if self._loaded_devices_for_endpoint(endpoint.name):
+            return False
+        try:
+            snapshot = endpoint.require_entry_sensor_snapshot(timeout=1.25)
+        except Exception as exc:
+            logging.info('BMCU could not read %s entry sensor before auto-feed: %s',
+                         endpoint.name, exc)
+            return False
+        if snapshot.get('physical_detected') is not True:
+            return False
+        try:
+            path = endpoint.native_path_status()
+        except Exception:
+            path = {}
+        if str(path.get('channel_state', '') or '').lower() == 'load_finish':
+            return False           # the stock feeder's own load
+        return True
+
+    def _u1_should_identify_before_load(self, endpoint, prefetched=False):
+        """During a print, before loading into a U1 Head: is there filament at its
+        sensor that BMCU must identify first? Not for BMCU's own staged filament
+        (prestaged or prefetched for this Head), which sits at the sensor by design,
+        and only with X/Y homed (identification moves the Head)."""
+        if endpoint is None or endpoint.driver != 'snapmaker_u1' or prefetched:
+            return False
+        if self._print_state() not in ('printing', 'paused', 'pause'):
+            return False
+        if any(isinstance(record, dict) and record.get('endpoint') == endpoint.name
+               for record in tuple(getattr(self, 'prestaged', {}).values())):
+            return False
+        if self._u1_background_jobs.get(endpoint.name):
+            return False
+        toolhead = self.printer.lookup_object('toolhead', None)
+        try:
+            homed = str(toolhead.get_status(self.reactor.monotonic()).get(
+                'homed_axes', '') or '').lower()
+        except Exception:
+            return False
+        if 'x' not in homed or 'y' not in homed:
+            return False
+        return self._u1_unaccounted_head_filament(endpoint)
+
+    def _u1_identify_temperature(self, endpoint, candidates):
+        route = self._first_u1_route_for_endpoint(endpoint.name)
+        tools = []
+        if route is not None:
+            tools.append(int(route.get('tool', -1)))
+        tools += [self._virtual_tool_for_source(device, channel)
+                  for device, channel in candidates]
+        for tool in tools:
+            if tool < 0:
+                continue
+            profile = self._u1_temperature_profile(tool=tool)
+            try:
+                value = float((profile or {}).get('temperature'))
+            except (TypeError, ValueError):
+                continue
+            if 170.0 <= value <= 320.0:
+                return value
+        return 220.0
+
+    def _identify_u1_head_filament(self, endpoint, head, gcmd=None):
+        """Work out which BMCU Channel feeds the unaccounted filament in this Head by
+        extruding a little and watching which Channel's encoder follows, then record
+        that route as LOADED so the normal source selection keeps it or swaps it."""
+        candidates = [(device, channel)
+                      for device, channel in self._assigned_routes_for_endpoint(endpoint.name)
+                      if getattr(device, 'ready', False)]
+        if not candidates:
+            raise BMCUError(
+                'Head %d has filament at its sensor that BMCU has no record of, and '
+                'none of its BMCU Channels is online to check it against' % (head + 1))
+        temperature = self._u1_identify_temperature(endpoint, candidates)
+        logging.info('BMCU Head %d has unrecorded filament at its sensor; identifying it '
+                     'among %s', head + 1, ', '.join(
+                         '%s Channel %d' % (d.name, c + 1) for d, c in candidates))
+        if gcmd is not None:
+            gcmd.respond_info('BMCU: Head %d has filament BMCU has no record of; '
+                              'checking which Channel it is' % (head + 1))
+        self.gcode.run_script_from_command(
+            'T%d A0\nMOVE_TO_DISCARD_FILAMENT_POSITION\nM109 S%.0f' % (head, temperature))
+
+        def meters():
+            values = {}
+            for device, _channel in candidates:
+                if device.name not in values:
+                    status = device.refresh()
+                    values[device.name] = list(status.get('meters') or [])
+            return values
+
+        before = meters()
+        self.gcode.run_script_from_command(
+            'SAVE_GCODE_STATE NAME=BMCU_IDENTIFY\nM83\nG1 E%.1f F180\nM400\n'
+            'RESTORE_GCODE_STATE NAME=BMCU_IDENTIFY' % self.IDENTIFY_EXTRUDE_MM)
+        self.reactor.pause(self.reactor.monotonic() + 0.6)
+        after = meters()
+        moved = []
+        for device, channel in candidates:
+            try:
+                delta = abs(float(after[device.name][channel]) -
+                            float(before[device.name][channel])) * 1000.0
+            except (KeyError, IndexError, TypeError, ValueError):
+                delta = 0.0
+            moved.append((delta, device, channel))
+        moved.sort(key=lambda item: -item[0])
+        summary = ', '.join('%s Channel %d %.1f mm' % (d.name, c + 1, m)
+                            for m, d, c in moved)
+        followers = [item for item in moved if item[0] >= self.IDENTIFY_MOVED_MM]
+        unclear = [item for item in moved
+                   if self.IDENTIFY_STILL_MM < item[0] < self.IDENTIFY_MOVED_MM]
+        if len(followers) != 1 or unclear:
+            if not followers and not unclear:
+                raise BMCUError(
+                    "Head %d has filament BMCU has no record of, and none of its BMCU "
+                    "Channels moved when the Head extruded %.0f mm (%s). If it is the "
+                    "stock feeder's filament, unload it from the screen; otherwise pull "
+                    "it back and start the print again" % (
+                        head + 1, self.IDENTIFY_EXTRUDE_MM, summary))
+            raise BMCUError(
+                'Head %d has filament BMCU has no record of, and extruding %.0f mm '
+                "didn't single out one Channel (%s); pull the filament back and start "
+                'the print again' % (head + 1, self.IDENTIFY_EXTRUDE_MM, summary))
+        _delta, device, channel = followers[0]
+        self._adopt_identified_u1_route(device, channel, endpoint, head)
+        logging.info('BMCU identified the filament in Head %d as %s Channel %d (%s)',
+                     head + 1, device.name, channel + 1, summary)
+        if gcmd is not None:
+            gcmd.respond_info('BMCU: Head %d holds %s Channel %d; recorded it as loaded' %
+                              (head + 1, device.name, channel + 1))
+        return device, channel
+
+    def _adopt_identified_u1_route(self, device, channel, endpoint, head):
+        """Record an identified Channel as LOADED in its Head (the same commit as
+        BMCU_ROUTE_CONFIRM STATE=LOADED, allowed at print start)."""
+        route_key = self._route_key(device, channel)
+        self._lock(device, endpoint, 'ROUTE_IDENTIFY', channel=channel)
+        try:
+            previous = dict(device.refresh())
+            if not (int(previous.get('calibration_valid_mask', 0)) & (1 << channel)):
+                raise BMCUError('%s Channel %d buffer calibration is invalid' %
+                                (device.name, channel + 1))
+            self._require_exclusive_endpoint_route(device, endpoint, channel)
+            device.mark_loaded(channel)
+            current = dict(device.refresh())
+            if self._route_states_from_status(current)[channel] != protocol.ROUTE_LOADED:
+                self._uncertain_routes.add(route_key)
+                raise BMCUError('%s Channel %d did not confirm LOADED' %
+                                (device.name, channel + 1))
+            self._arm_u1_persistent_hold(
+                endpoint, device, channel,
+                'filament identified in Head %d at print start' % (head + 1))
+            self._commit_u1_route_ownership(device, channel, protocol.ROUTE_LOADED)
+            self._uncertain_routes.discard(route_key)
+            self.device_status_changed(device, previous, current)
+            tool = self._virtual_tool_for_source(device, channel)
+            if tool >= 0:
+                self.loaded_tools[route_key] = tool
+            self._u1_lease_dirty = True
+            self._save_runtime()
+        finally:
+            self._unlock(device, endpoint)
+
     def cmd_SNAP_AUTO_FEED(self, gcmd):
 
         self._require_standalone_operation('BMCU_AUTO_FEED', gcmd)
@@ -15637,6 +16285,9 @@ class BMCUManager(object):
 
         try:
             self._require_no_u1_cross_refill_pending()
+            if (self.print_map_active and self._assigned_routes_for_endpoint(endpoint.name)
+                    and self._u1_unaccounted_head_filament(endpoint)):
+                self._identify_u1_head_filament(endpoint, head, gcmd)
             candidates = []
             identities = set()
             if self.print_map_active:
@@ -16269,7 +16920,22 @@ class BMCUManager(object):
                         'T%d native U1 Head %d endpoint is unavailable' %
                         (tool, head + 1))
                 owner = self._u1_owner_status(endpoint)
+                take_over_refusal = None
+                if owner.get('owner') == 'bmcu':
+                    take_over_refusal = self._u1_native_take_over_refusal(endpoint, owner)
+                if owner.get('owner') == 'bmcu' and take_over_refusal is None:
+                    logging.info(
+                        'BMCU print plan: T%d uses native U1 Head %d, which BMCU '
+                        'filament holds now; it is unloaded when the print switches '
+                        'to the stock feeder', tool, head + 1)
+                    resolved.append((tool, None, None, head))
+                    continue
                 if owner.get('owner') not in ('native', 'native_busy'):
+                    if take_over_refusal:
+                        raise gcmd.error(
+                            'T%d cannot use native U1 Head %d: BMCU filament is in '
+                            'this Head and it cannot hand the Head to the stock '
+                            'feeder because %s' % (tool, head + 1, take_over_refusal))
                     raise gcmd.error(
                         'T%d cannot use native U1 Head %d: owner is %s (%s)' %
                         (tool, head + 1, owner.get('owner', 'unknown'),
@@ -18793,6 +19459,9 @@ class BMCUManager(object):
 
         endpoint_name = str(gcmd.get('ENDPOINT', '') or '').strip()
         head_value = gcmd.get_int('HEAD', None, minval=1, maxval=4)
+        # The operator states the stock filament was pulled back clear of the shared
+        # tube; the stock feeder still sees it at its input, so it reads occupied.
+        stock_retracted = bool(gcmd.get_int('STOCK_RETRACTED', 0, minval=0, maxval=1))
         if endpoint_name:
             endpoint = self.endpoints.get(endpoint_name)
             if endpoint is None:
@@ -18873,10 +19542,23 @@ class BMCUManager(object):
 
             snapshot = endpoint.require_entry_sensor_snapshot(timeout=1.25, expected=False)
             path = endpoint.native_path_status()
-            if (not path.get('known') or path.get('busy') or
+            if (not path.get('known') or
                     self._endpoint_has_loaded_or_active_route(endpoint_name) or
                     self._u1_disconnect_hazards.get(endpoint_name)):
                 raise BMCUError('%s shared path is not positively EMPTY' % endpoint_name)
+            if path.get('busy'):
+                if not stock_retracted:
+                    raise BMCUError(
+                        '%s stock path reads occupied (stock feeder state %s, filament %s at '
+                        'its input). Pull the filament out of the stock feeder, or - if you '
+                        'pulled it back clear of the shared tube - run again with '
+                        'STOCK_RETRACTED=1' % (
+                            endpoint_name, path.get('channel_state') or '?',
+                            'detected' if path.get('feeder_input_detected') else 'not detected'))
+                logging.warning(
+                    'BMCU %s EMPTY confirmed with STOCK_RETRACTED=1 while the stock path '
+                    'read occupied (feeder state %s)', endpoint_name,
+                    path.get('channel_state') or '?')
             changed = endpoint.commit_native_path_empty(
                 sensor_snapshot=snapshot, manual_confirmation=True)
             self._clear_endpoint_projection(endpoint)

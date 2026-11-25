@@ -150,7 +150,7 @@ bool bmcu_runtime_set_autoload_lengths(const float values_m[4])
     for (uint8_t channel = 0u; channel < 4u; channel++)
     {
         if (!isfinite(values_m[channel]) ||
-                values_m[channel] < 0.010f || values_m[channel] > 1.000f)
+                values_m[channel] < 0.010f || values_m[channel] > 2.000f)
             return false;
     }
     for (uint8_t channel = 0u; channel < 4u; channel++)

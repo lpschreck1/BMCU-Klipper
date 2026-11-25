@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import string
+import sys
 
 import chelper
 
@@ -2016,6 +2017,56 @@ class SnapmakerU1Endpoint(Endpoint):
     def native_feeder_takeover_enabled(self):
         return bool(self.get('u1_native_feeder_takeover', False))
 
+    def preload_is_clear(self):
+        return bool(self.get('u1_preload_clear', False))
+
+    # Snapmaker's preload stop (filament_feed.py): preload_length is turned into a
+    # wheel-count limit per feeder module, shared by that module's two heads.
+    PRELOAD_LENGTH_MIN_MM = 600.0
+    PRELOAD_LENGTH_MAX_MM = 1500.0
+    PRELOAD_LENGTH_DEFAULT_MM = 850.0
+
+    def preload_length_setting(self):
+        """BMCU's preload length for this head's feeder module in mm; 0 means
+        Snapmaker's own printer.cfg value. Defaults to 850 mm,
+        which keeps preloaded stock filament back from shared paths without pushing
+        long stock routes past the 60 s load limit."""
+        raw = self.get('u1_preload_length', None)
+        if raw is None:
+            return self.PRELOAD_LENGTH_DEFAULT_MM
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return self.PRELOAD_LENGTH_DEFAULT_MM
+        if value < self.PRELOAD_LENGTH_MIN_MM or value > self.PRELOAD_LENGTH_MAX_MM:
+            return 0.0
+        return value
+
+    @staticmethod
+    def _feeder_wheel_circumference(feeder):
+        module = sys.modules.get(type(feeder).__module__)
+        try:
+            return float(getattr(module, 'FEED_WHEEL_CIRCUMFERENCE', 31.4159))
+        except (TypeError, ValueError):
+            return 31.4159
+
+    def native_preload_status(self):
+        feeder = self._native_feeder_object()
+        result = {'configured_mm': self.preload_length_setting(),
+                  'active_mm': None, 'printer_cfg_mm': None, 'supported': False}
+        if feeder is None or not hasattr(feeder, '_feed_preload_counts'):
+            return result
+        circumference = self._feeder_wheel_circumference(feeder)
+        try:
+            active = int(feeder._feed_preload_counts)
+            default = int(getattr(feeder, '_bmcu_printer_cfg_preload_counts', active))
+        except (TypeError, ValueError):
+            return result
+        result.update({'supported': True,
+                       'active_mm': round(active * circumference / 2.0),
+                       'printer_cfg_mm': round(default * circumference / 2.0)})
+        return result
+
     def native_feeder_confirmation_required(self):
         return bool(self.get('u1_require_feeder_confirmation', True))
 
@@ -2077,16 +2128,183 @@ class SnapmakerU1Endpoint(Endpoint):
                 self._head())
         return dict(state)
 
+    def _clear_stale_native_head_presence(self, channel):
+        # While printing, the U1 head motion sensor keeps reporting filament for
+        # detection_length of head-extruder motion after the switch opens, so a
+        # normal runout can use up the tail. When BMCU pulled its filament back
+        # with its own motor the head extruder never moved, so the sensor still
+        # reports filament, and FEED_AUTO then skips feeding the stock source.
+        # Clear only that stale report, without a runout event, when the switch
+        # itself reads empty.
+        feeder = self._native_feeder_object(strict=False)
+        sensors = getattr(feeder, 'runout_sensor', None)
+        try:
+            sensor = sensors[channel]
+        except (TypeError, IndexError, KeyError):
+            return False
+        helper = getattr(sensor, 'runout_helper', None)
+        if (sensor is None or helper is None or
+                not hasattr(sensor, 'runout_buttun_state') or
+                not hasattr(helper, 'filament_present')):
+            return False
+        if bool(sensor.runout_buttun_state) or not bool(helper.filament_present):
+            return False
+        try:
+            snapshot = self.entry_sensor_snapshot()
+        except Exception:
+            snapshot = {}
+        if snapshot.get('physical_detected') is True:
+            return False
+        timer = getattr(sensor, '_extruder_pos_update_timer', None)
+        if timer is not None:
+            self.manager.reactor.update_timer(timer, self.manager.reactor.NEVER)
+        helper.filament_present = False
+        logging.info(
+            'BMCU cleared stale filament presence on U1 head %d sensor before '
+            'native stock load (switch reads empty)', self._head() + 1)
+        return True
+
+    # Snapmaker's stock load gives up when filament hasn't reached the head within 60 s
+    # (FEED_LOAD_TIMEOUT_TIME in filament_feed.py); warn well before that.
+    NATIVE_FEED_LIMIT_S = 60.0
+    NATIVE_FEED_WARN_S = 40.0
+
+    def _watch_native_feed_arrival(self, channel):
+        """Time from now until the head sensor sees the stock filament arrive. Returns
+        (stop, result): call stop() after the load; result['seconds'] is then the time,
+        or None if it wasn't seen."""
+        result = {'seconds': None}
+        feeder = self._native_feeder_object(strict=False)
+        try:
+            helper = feeder.runout_sensor[channel].runout_helper
+        except (AttributeError, TypeError, IndexError, KeyError):
+            helper = None
+        reactor = getattr(self.manager, 'reactor', None)
+        if helper is None or reactor is None or not hasattr(helper, 'filament_present'):
+            return (lambda: None), result
+        start = reactor.monotonic()
+
+        def poll(eventtime):
+            if result['seconds'] is None and bool(helper.filament_present):
+                result['seconds'] = eventtime - start
+                return reactor.NEVER
+            return eventtime + 0.25
+        timer = reactor.register_timer(poll, reactor.NOW)
+
+        def stop():
+            try:
+                reactor.unregister_timer(timer)
+            except Exception:
+                pass
+        return stop, result
+
+    def _report_native_feed_time(self, seconds):
+        if seconds is None or seconds < self.NATIVE_FEED_WARN_S:
+            return
+        message = ('BMCU: the stock feeder took %.0f s to bring filament to U1 head %d; Snapmaker '
+                   'stops a stock load after %.0f s. Shorten or ease that path (or move preload '
+                   'closer to the head) before it fails mid-print.' %
+                   (seconds, self._head() + 1, self.NATIVE_FEED_LIMIT_S))
+        logging.warning(message)
+        try:
+            self.gcode.respond_info(message)
+        except Exception:
+            pass
+
+    # Snapmaker's pre-extrude reheats to this when the head has no usable target.
+    NATIVE_FALLBACK_TEMP = 220.0
+
+    def _native_heater(self):
+        extruder = self.printer.lookup_object(self._configured_extruder_name(), None)
+        if extruder is None:
+            return None
+        getter = getattr(extruder, 'get_heater', None)
+        return getter() if callable(getter) else getattr(extruder, 'heater', None)
+
+    def _native_print_temperature(self):
+        """The head's printing target before a stock load, or the pre-extrude fallback."""
+        heater = self._native_heater()
+        try:
+            target = float(getattr(heater, 'target_temp', 0.0) or 0.0)
+            minimum = float(getattr(heater, 'min_extrude_temp', 170.0) or 170.0)
+        except (TypeError, ValueError):
+            target, minimum = 0.0, 170.0
+        if target >= minimum:
+            return target
+        logging.warning(
+            'BMCU U1 head %d had no printing temperature before the stock load '
+            '(target %.0fC); using %.0fC as Snapmaker pre-extrude does',
+            self._head() + 1, target, self.NATIVE_FALLBACK_TEMP)
+        return self.NATIVE_FALLBACK_TEMP
+
+    def _restore_after_native_load(self, temperature):
+        # Snapmaker's load ends at the purge position with the heater off (its flush
+        # ends with M104 S0, and FEED_AUTO turns the heater off again). Its own runout
+        # refill restores both through PAUSE/RESUME; mid-tool-change nothing does. Put
+        # back what the skipped pre-extrude used to leave: heater at the printing
+        # temperature and the head at its XY idle position, with the slicer's G-code
+        # modes restored.
+        heater = self._configured_extruder_name()
+        self._run('SET_HEATER_TEMPERATURE HEATER=%s TARGET=%.1f' % (heater, temperature))
+        self._run('MOVE_TO_XY_IDLE_POSITION_EXTRUDER')
+        self._run('TEMPERATURE_WAIT SENSOR=%s MINIMUM=%.1f' % (heater, temperature - 5.0))
+        self._run('RESTORE_GCODE_STATE NAME=BMCU_NATIVE_LOAD MOVE=0')
+        logging.info(
+            'BMCU restored U1 head %d after the stock load: %.0fC, XY idle position',
+            self._head() + 1, temperature)
+
+    # Snapmaker's flush retracts by |printing_e_pos| while printing, expecting the
+    # slicer's next unretract to give it back. BMCU's own head moves on this tool
+    # change (pullback, unload) also count into printing_e_pos, so the flush could
+    # pull the new stock filament back tens of mm and the print ran dry until the
+    # extruder caught up. Keep the flush's retract to Snapmaker's own default.
+    NATIVE_FLUSH_RETRACT_CAP_MM = 5.0
+
+    def _limit_native_flush_retract(self):
+        extruder = self.printer.lookup_object(self._configured_extruder_name(), None)
+        try:
+            pending = float(getattr(extruder, 'printing_e_pos'))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        limited = max(pending, -self.NATIVE_FLUSH_RETRACT_CAP_MM)
+        if limited != pending:
+            extruder.printing_e_pos = limited
+        logging.info(
+            'BMCU U1 head %d stock load: pending retract %.1f mm before the flush%s',
+            self._head() + 1, -pending,
+            '' if limited == pending else ', limited to %.1f mm' % -limited)
+        return pending
+
+    def prepare_native_stock_load(self, printing=True):
+        """Before Snapmaker's stock load at print start: clear a lagging head-sensor
+        report so Snapmaker's load doesn't skip its push."""
+        _module, channel = self.native_feeder_target()
+        if printing:
+            self._clear_stale_native_head_presence(channel)
+
     def native_feeder_load(self, printing=True):
         module, channel = self.native_feeder_target()
-        self._run('FEED_AUTO MODULE=%s CHANNEL=%d LOAD=1 PRINTING=%d' %
-                  (module, channel, 1 if printing else 0))
+        temperature = None
+        if printing:
+            self._clear_stale_native_head_presence(channel)
+            temperature = self._native_print_temperature()
+            self._run('SAVE_GCODE_STATE NAME=BMCU_NATIVE_LOAD', wait_moves=False)
+            self._limit_native_flush_retract()
+        stop_watch, arrival = self._watch_native_feed_arrival(channel)
+        try:
+            self._run('FEED_AUTO MODULE=%s CHANNEL=%d LOAD=1 PRINTING=%d' %
+                      (module, channel, 1 if printing else 0))
+        finally:
+            stop_watch()
+        self._report_native_feed_time(arrival['seconds'])
         state = self._native_feeder_status(strict=True)
         if str(state.get('channel_state', '') or '').strip().lower() != 'load_finish':
             raise EndpointError(
                 'U1 native feeder did not confirm LOADED for head %d' %
                 self._head())
         self._native_empty_projection = False
+        if printing:
+            self._restore_after_native_load(temperature)
         return state
 
     def reconcile_entry_sensor_empty_after_pullback(
@@ -2239,6 +2457,11 @@ class SnapmakerU1Endpoint(Endpoint):
         verified_projection = bool(
             self._native_empty_projection and channel_state == 'unload_finish')
         inherently_safe = channel_state in ('', 'none', 'inited', 'wait_insert')
+        # Opt-in per head: the stock feeder parks a preloaded filament upstream of
+        # the point where the BMCU route joins this head's path.
+        preload_clear = bool(
+            channel_state == 'preload_finish' and self.preload_is_clear())
+        inherently_safe = inherently_safe or preload_clear
         input_released = bool(
             feeder_input is False and channel_state in (
                 'load_finish', 'unload_finish', 'preload_finish'))
@@ -2257,6 +2480,7 @@ class SnapmakerU1Endpoint(Endpoint):
             'manual_retract_required': bool(
                 busy and channel_state in (
                     'load_finish', 'unload_finish', 'preload_finish')),
+            'preload_clear': preload_clear,
         }
 
     def ensure_native_feeder_takeover(self, save=False, allow_occupied=False):
@@ -5191,6 +5415,8 @@ class SnapmakerU1Endpoint(Endpoint):
         result.update({
             'u1_native_feeder_takeover': self.native_feeder_takeover_enabled(),
             'u1_require_feeder_confirmation': self.native_feeder_confirmation_required(),
+            'u1_preload_clear': self.preload_is_clear(),
+            'u1_preload_length': self.native_preload_status(),
             'u1_feeder_module': module,
             'u1_feeder_channel': channel,
             'u1_native_feeder_disabled': None if state is None else bool(state.get('disable_auto', False)),
@@ -5405,6 +5631,7 @@ class SnapmakerU1Endpoint(Endpoint):
                 ('u1_prime_length_mm', 20.0, 0.0, 100.0),
                 ('u1_refill_prime_length_mm', 20.0, 0.0, 100.0),
                 ('u1_rfid_quiesce_timeout', 3.0, 0.1, 10.0),
+                ('u1_preload_length', 850.0, 0.0, 1500.0),
                 ('u1_prestage_park_timeout', 20.0, 1.0, 60.0),
                 ('u1_unload_assist_chunk_mm', 5.0, 1.0, 20.0),
                 ('u1_unload_assist_feed', 600.0, 60.0, 1800.0),
