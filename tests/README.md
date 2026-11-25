@@ -11,3 +11,6 @@ python3 -m unittest discover -s tests -v
 They import `klippy/extras/bmcu_core` directly, with stand-ins for Klipper's C helpers
 (see `_support.py`), so no printer, Klipper checkout or BMCU is needed. CI runs them on
 every push and pull request (`.github/workflows/tests.yml`).
+
+The Snapmaker U1 + BMCU end-to-end simulator (scenario tests, resume sweep) is in
+`tests/sim/`; see `tests/sim/README.md`. It runs in the same command.
