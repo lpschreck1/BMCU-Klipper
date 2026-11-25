@@ -5,12 +5,14 @@ pause_resume.py, print_stats.py and lava/fluidd.cfg. The stock feeder and the he
 sensors are in feeder.py, the SD-card print in virtual_sdcard.py. Guesses carry a
 ``# MODEL:`` comment and are listed in tests/sim/README.md.
 """
+import collections
 import copy
 
 from . import feeder as F
 from . import klipper as K
 
 PHYSICAL_EXTRUDER_NUM = 4
+Coord = collections.namedtuple('Coord', ('x', 'y', 'z', 'e'))
 
 
 class Coil(object):
@@ -35,6 +37,8 @@ class U1Extruder(K.FakeExtruder):
         self.nozzle_diameter = 0.4
         self.nozzle_volume_type = 'standard'
         self.total_e = 0.0               # all extruder motion, for the sensor lag
+        self.print_commanded = 0.0       # E asked for while printing (forward moves)
+        self.print_flow = 0.0            # of which actually left the nozzle
         self.binding_probe = BindingProbe(sim, index)
 
     def find_past_position(self, print_time):
@@ -63,6 +67,8 @@ class PrintStats(object):
         self.state = 'standby'
         self.filename = ''
         self.message = ''
+        self._config = {'print_count': 0}
+        self._config_path = '%s/print_stats.json' % sim.tmp
 
     def get_status(self, eventtime=None):
         return {'state': self.state, 'filename': self.filename,
@@ -153,6 +159,7 @@ class PrintTaskConfig(object):
                              'end_unload_filament': [False] * n,
                              'flow_calib_extruders': [True] * n},
         }
+        self.config_path = '%s/print_task.json' % sim.tmp
         self.print_task_config_2 = {'nozzle_temp': [0] * 32, 'filament_type': [None] * 32}
         self.filament_info_backup = {
             'filament_vendor': ['NONE'] * n, 'filament_type': ['NONE'] * n,
@@ -163,7 +170,7 @@ class PrintTaskConfig(object):
         g.register_command('INNER_CHECK_AND_RELOAD_FILAMENT_INFO', self.cmd_check_reload)
         for name in ('SET_PRINT_USED_EXTRUDERS', 'SET_PRINT_EXTRUDER_MAP',
                      'INNER_AUTO_REPLENISH_FILAMENT', 'FILAMENT_DT_CLEAR',
-                     'FLOW_RESET_K', 'SET_PRINT_FILAMENT_CONFIG',
+                     'FLOW_RESET_K', 'SET_PRINT_FILAMENT_CONFIG', 'FILAMENT_DT_UPDATE',
                      'SET_PRINT_PREFERENCES'):
             g.register_command(name, lambda gcmd: None)
 
@@ -228,7 +235,7 @@ class GcodeMove(object):
 
     def get_status(self, eventtime=None):
         pos = self.sim.toolhead.position
-        return {'gcode_position': {'x': pos[0], 'y': pos[1], 'z': pos[2], 'e': pos[3]},
+        return {'gcode_position': Coord(*pos),
                 'absolute_extrude': self.absolute_extrude, 'speed': self.speed}
 
     def cmd_G92(self, gcmd):
@@ -267,11 +274,13 @@ class GcodeMove(object):
                 delta, self.last_e = value - self.last_e, value
             else:
                 delta = value
-            self.extrude(delta)
+            # a G1 straight from the print file (not from a macro) is the sliced print
+            body = sim.sdcard.is_cmd_from_sd() and sim.gcode.depth == 1
+            self.extrude(delta, body)
         else:
             sim.reactor.pause(sim.reactor.monotonic() + 0.05)
 
-    def extrude(self, delta):
+    def extrude(self, delta, body=False):
         sim = self.sim
         extruder = sim.toolhead.get_extruder()
         if delta > 0 and not extruder.can_extrude():
@@ -280,9 +289,13 @@ class GcodeMove(object):
             extruder.printing_e_pos = min(0.0, extruder.printing_e_pos + delta)
         remaining = abs(delta)
         sign = 1.0 if delta >= 0 else -1.0
+        printing = body and sim.print_stats.state == 'printing' and delta > 0
         while remaining > 1e-9:
             step = min(5.0, remaining)
-            sim.world.gear_move(extruder.index, sign * step)
+            _moved, flow = sim.world.gear_move(extruder.index, sign * step)
+            if printing:
+                extruder.print_commanded += step
+                extruder.print_flow += flow
             extruder.total_e += step
             sim.reactor.pause(sim.reactor.monotonic() + step / max(self.speed, 0.1))
             remaining -= step
@@ -337,6 +350,10 @@ class SnapmakerMacros(object):
         for head in range(4):
             reg('T%d' % head, self.cmd_Tn)
             reg('PARK_EXTRUDER%d' % head, lambda gcmd, h=head: self.park(h))
+        for tool in range(4, 32):
+            # [gcode_macro T4..T31]: SWITCH_OF_EXTENDED_EXTRUDER INDEX=n picks the
+            # physical head from extruder_map_table
+            reg('T%d' % tool, self.cmd_extended_tool)
         reg('M104', self.cmd_M104)
         reg('M109', self.cmd_M109)
         reg('SET_HEATER_TEMPERATURE', self.cmd_SET_HEATER_TEMPERATURE)
@@ -355,6 +372,7 @@ class SnapmakerMacros(object):
         reg('SM_PRINT_PREEXTRUDE_FILAMENT', self.cmd_preextrude)
         reg('SM_PRINT_EXTRUDER_PREHEAT', self.cmd_preheat)
         reg('SM_PRINT_AUTO_FEED', self.cmd_sm_auto_feed)
+        reg('SM_PRINT_CHECK_SWITCH_EXTRUDER', self.cmd_check_switch)
         reg('_CLIENT_RETRACT', self.cmd_client_retract)
         reg('_CLIENT_EXTRUDE', self.cmd_client_extrude)
         reg('INNER_FILAMENT_UNLOAD', self.cmd_inner_unload)
@@ -396,9 +414,18 @@ class SnapmakerMacros(object):
         self.sim.extruders[head].park_state = 'active'
         self.log.append('T%d' % head)
 
+    def cmd_extended_tool(self, gcmd):
+        tool = int(gcmd.get_command()[1:])
+        table = self.sim.print_task_config.print_task_config['extruder_map_table']
+        self.g.run_script_from_command('T%d A0' % int(table[tool]))
+
     def _head_of(self, gcmd, default=None):
         t = gcmd.get_int('T', None)
-        return self.sim.toolhead.active if t is None else t
+        if t is None:
+            return self.sim.toolhead.active
+        # Snapmaker maps a logical tool to a physical head with extruder_map_table
+        table = self.sim.print_task_config.print_task_config['extruder_map_table']
+        return int(table[t]) if 0 <= t < len(table) else t
 
     def cmd_M104(self, gcmd):
         temp = gcmd.get_float('S', 0.0)
@@ -531,6 +558,14 @@ class SnapmakerMacros(object):
         cfg = self.sim.print_task_config.print_task_config
         if 0 <= head < PHYSICAL_EXTRUDER_NUM and cfg['extruders_used'][head]:
             self.g.run_script_from_command('M104 S%d T%d A0' % (temp, head))
+
+    def cmd_check_switch(self, gcmd):
+        used = self.sim.print_task_config.print_task_config['extruders_used']
+        self.g.run_script_from_command('SET_ACTION_CODE ACTION=PRINT_SWITCH_CHECKING')
+        for head in range(PHYSICAL_EXTRUDER_NUM):
+            if used[head]:
+                self.g.run_script_from_command('T%d A0' % head)
+        self.g.run_script_from_command('SET_ACTION_CODE ACTION=IDLE')
 
     def cmd_inner_unload(self, gcmd):
         self.log.append('INNER_FILAMENT_UNLOAD')

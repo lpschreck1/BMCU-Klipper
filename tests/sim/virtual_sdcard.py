@@ -11,6 +11,14 @@ the behaviour the plan marked as observed (plan section 9).
 from . import klipper as K
 
 
+class _File(object):
+    def __init__(self, name):
+        self.name = name
+
+    def close(self):
+        return None
+
+
 class VirtualSDCard(object):
     def __init__(self, sim):
         self.sim = sim
@@ -32,7 +40,7 @@ class VirtualSDCard(object):
     def load(self, name, text):
         self.file_name = name
         self.text = text
-        self.current_file = name
+        self.current_file = _File(name)
         self.file_position = 0
         self.next_file_position = 0
         self.lines = 0

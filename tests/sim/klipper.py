@@ -109,6 +109,8 @@ class FakeGcode(object):
         self.history = []             # every command dispatched, in order
         self.on_dispatch = None       # hook(command, commandline)
         self._mutex = _Mutex()
+        self.mux_commands = {}
+        self.depth = 0
 
     def get_mutex(self):
         return self._mutex
@@ -122,7 +124,19 @@ class FakeGcode(object):
         return old
 
     def register_mux_command(self, cmd, key, value, func, desc=None):
-        self.register_command('%s %s=%s' % (cmd, key, value), func)
+        """Klipper's mux commands: one handler per value of ``key``."""
+        prev = self.mux_commands.get(cmd)
+        if prev is None:
+            prev = self.mux_commands[cmd] = (key, {})
+
+            def handler(gcmd, cmd=cmd):
+                key_name, table = self.mux_commands[cmd]
+                selected = gcmd.get(key_name, None)
+                if selected not in table:
+                    raise gcmd.error('Unknown %s %s' % (key_name, selected))
+                table[selected](gcmd)
+            self.register_command(cmd, handler)
+        prev[1][value] = func
 
     def respond_info(self, msg, log=True):
         for line in str(msg).split('\n'):
@@ -172,7 +186,11 @@ class FakeGcode(object):
         handler = self.ready_gcode_handlers.get(command)
         if handler is None:
             raise CommandError('Unknown command:"%s"' % command)
-        handler(GCodeCommand(self, command, commandline, params))
+        self.depth += 1
+        try:
+            handler(GCodeCommand(self, command, commandline, params))
+        finally:
+            self.depth -= 1
 
 
 class FakeConfig(object):
@@ -392,6 +410,7 @@ class FakeToolhead(object):
     def get_status(self, eventtime=None):
         return {'homed_axes': self.homed_axes,
                 'position': tuple(self.position),
+                'axis_maximum': (270.0, 270.0, 270.5, 0.0),
                 'extruder': self.active_name,
                 'print_time': 0.0, 'estimated_print_time': 0.0}
 

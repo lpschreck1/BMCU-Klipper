@@ -152,7 +152,7 @@ class Feeder(object):
         self.puts = 0
         self.log = []
         sim.printer.add_object('filament_feed %s' % module, self)
-        sim.gcode.register_command('FEED_AUTO', self.cmd_FEED_AUTO)
+        sim.gcode.register_mux_command('FEED_AUTO', 'MODULE', module, self.cmd_FEED_AUTO)
 
     # -- the hooks BMCU calls -------------------------------------------------
     def _hang_neutral(self, channel):

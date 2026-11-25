@@ -151,7 +151,7 @@ class Sim(object):
         channel = F.FEEDERS[module].index(head)
         self.feeders[module].port_changed(channel)
 
-    def setup_u1(self, early_park=False):
+    def setup_u1(self, early_park=False, preload_clear=True):
         """Preset, routes (channels 1-2 -> head 3, 3-4 -> head 4).
 
         # MODEL: the early-park tip tail (``BMCU_PARK_HEAD``) drives Klipper's C step
@@ -161,6 +161,9 @@ class Sim(object):
         """
         from bmcu_core import endpoints as E
         self.run_gcode('BMCU_APPLY_PRESET PRESET=snapmaker_u1')
+        if preload_clear:
+            for head in (2, 3):     # heads that share a tube between stock and BMCU
+                self.run_gcode('BMCU_SET_ENDPOINT NAME=u1_head%d SNAP_PRELOAD_CLEAR=1' % head)
         head = self.world.heads[2]
         full = (1500.0 + head.shared + head.sensor_to_gears + head.gears_to_nozzle + 60.0)
         for channel in range(4):
@@ -200,6 +203,48 @@ class Sim(object):
         if self.bmcu is not None:
             self.bmcu.fw.send_status(0)
 
+    # -- printing ---------------------------------------------------------------
+    def slice(self, plan, materials=None, colors=None, **kwargs):
+        """Synthesise a print. ``plan`` lists the tools per layer, e.g. ``[[0], [4, 6], [3]]``.
+        Marks the stock heads it uses in Snapmaker's print task and loads the file."""
+        from . import gcode_gen
+        tools = sorted(set(t for layer in plan for t in layer))
+        materials = dict(materials or {})
+        for tool in tools:
+            materials.setdefault(tool, 'PLA')
+        text = gcode_gen.build(plan, materials, colors, **kwargs)
+        path = os.path.join(self.tmp, 'print.gcode')
+        with open(path, 'w') as stream:
+            stream.write(text)
+        self.sdcard.load(path, text)
+        cfg = self.print_task_config.print_task_config
+        for tool in tools:
+            if tool < 4:
+                cfg['extruders_used'][tool] = True
+                cfg['reprint_info']['extruders_used'][tool] = True
+        self.gcode_text = text
+        return path
+
+    def start_print(self):
+        self.run_gcode('SDCARD_PRINT_FILE')
+
+    def run_until_stopped(self, limit=7200.0):
+        """Advance until the print completes, pauses or fails. Returns the state."""
+        end = self.reactor.monotonic() + limit
+        while self.reactor.monotonic() < end:
+            self.reactor.pause(self.reactor.monotonic() + 1.0)
+            if not self.sdcard.is_active() and self.print_stats.state != 'printing':
+                break
+        return self.print_stats.state
+
+    def run_print(self):
+        self.start_print()
+        return self.run_until_stopped()
+
+    @property
+    def user(self):
+        return User(self)
+
     def run_gcode(self, script):
         self.gcode.run_script_from_command(script)
 
@@ -217,3 +262,20 @@ class Sim(object):
             self.bmcu.stop()
         if self._own_tmp:
             shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class User(object):
+    """What the human does at the screen."""
+
+    def __init__(self, sim):
+        self.sim = sim
+
+    def resume(self, limit=7200.0):
+        """Press Resume. Returns the state the print reaches next."""
+        sim = self.sim
+        sim.run_gcode('RESUME')
+        return sim.run_until_stopped(limit)
+
+    def cancel(self):
+        self.sim.run_gcode('CANCEL_PRINT')
+        self.sim.settle(1.0)
