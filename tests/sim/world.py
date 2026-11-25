@@ -77,6 +77,7 @@ class Source(object):
         self.snag_at = None           # tip cannot pass this p (Snag fault)
         self.runout_at = None         # spool ends at this p (Runout fault)
         self.present = False          # filament detected at the outlet
+        self.assisting = False        # its motor follows the head (see gear_move)
 
     # positions along this source's path
     @property
@@ -192,20 +193,18 @@ class World(object):
         return any(s.past(s.sensor_p) for s in self.heads[head].sources)
 
     def coil_freq(self, head):
-        """Coil frequency at the gears. # MODEL: a good grab is one tip in the
-        gears that is not deformed while the head has gripped; a clog or a
-        deformed tip stays near baseline."""
+        """Coil frequency at the gears. # MODEL: the coil sees a good grab (about
+        +1000) for 1.5 s after the gears last moved filament; a clog, a deformed tip
+        or no recent motion stays near baseline (plan 3.2: a miss is under 100)."""
         item = self.heads[head]
         if item.clog:
             return BASELINE_COIL + COIL_MISS_DELTA
+        if item.last_grip_at is not None and self.now - item.last_grip_at <= 1.5:
+            return BASELINE_COIL + COIL_GOOD_DELTA
         source = self.head_filament(head)
-        if source is None or not source.in_gears:
-            return BASELINE_COIL
-        if source.quality != 'good':
+        if source is not None and source.in_gears and source.quality != 'good':
             return BASELINE_COIL + COIL_MISS_DELTA
-        if item.last_grip_at is None:
-            return BASELINE_COIL
-        return BASELINE_COIL + COIL_GOOD_DELTA
+        return BASELINE_COIL
 
     # -- motion --------------------------------------------------------------
     def _limit(self, source, forward):
@@ -269,35 +268,53 @@ class World(object):
     def gear_move(self, head, mm):
         """The head's extruder gears move filament by ``mm`` (negative = back).
 
-        Only a tip that is in the gears is moved. Returns ``(moved, flow)``:
-        how far the filament moved and how much came out of the nozzle.
+        # MODEL: a tip between the entry sensor and the gears is carried up to the
+        # gears by its own source only when that source is *assisting* (its motor
+        # follows the head: BMCU in SEND_OUT/BEFORE_ON_USE/ON_USE, or the stock feeder
+        # while loading). The gears then grip a good tip and pull; a deformed tip or a
+        # clog is missed. Returns ``(moved, flow)``: filament movement and nozzle flow.
         """
         item = self.heads[head]
         mm = float(mm)
         if mm > 0 and not item.heater.can_extrude():
             raise WorldError('extrude below %.0f C' % MIN_EXTRUDE_TEMP)
-        source = self.head_filament(head)
-        if source is None or not source.in_gears:
+        candidates = [s for s in item.sources if s.past(s.sensor_p)]
+        if not candidates:
             return 0.0, 0.0
+        source = candidates[0]
         if mm >= 0:
+            moved = 0.0
+            remaining = mm
+            if source.tip < source.gears_p:
+                if not source.assisting:
+                    return 0.0, 0.0
+                moved += self._apply(source, min(remaining, source.gears_p - source.tip))
+                remaining -= moved
+                if source.tip < source.gears_p:
+                    return moved, 0.0
+            if remaining <= 1e-9:
+                return moved, 0.0
+            if source.quality != 'good' or item.clog:
+                return moved, 0.0                       # the gears miss the grab
             room = self._limit(source, True) - source.tip
             if source.spool_mm <= 0 and source.present:
                 room = 0.0
-            advance = min(mm, max(room, 0.0))
-            moved = self._apply(source, advance)
-            # filament already at the nozzle is extruded out of it
+            step = self._apply(source, min(remaining, max(room, 0.0)))
+            moved += step
+            if step > 0:
+                item.last_grip_at = self.now
             at_nozzle = source.tip >= source.nozzle_p - 1e-9
-            flow = 0.0
-            if not item.clog and at_nozzle:
-                flow = mm
-                item.extruded_mm += flow
-            elif not item.clog and moved > 0:
-                pass
-            if moved + 1e-9 < mm and not at_nozzle:
+            flow = remaining if at_nozzle and not item.clog else 0.0
+            item.extruded_mm += flow
+            if step + 1e-9 < remaining and not at_nozzle:
                 source.stalled = True
                 source.stall_reason = 'gears'
             return moved, flow
+        if not source.in_gears or source.quality != 'good':
+            return 0.0, 0.0
         moved = self._apply(source, mm)
+        if moved:
+            item.last_grip_at = self.now
         return moved, 0.0
 
     def feed_until(self, source, max_mm, stop_at_sensor=False, chunk=5.0,

@@ -358,10 +358,13 @@ class FakeExtruder(object):
                 'power': 0.0}
 
     def get_park_detector_status(self):
-        return {'state': self.park_state}
+        return {'state': self.park_state.upper()}
 
     def get_extruder_activate_status(self):
-        return self.name == self.printer.lookup_object('toolhead').active_name
+        # Snapmaker returns [(name, state_code)]; 0 means the head is grabbed
+        grabbed = (self.name == self.printer.lookup_object('toolhead').active_name and
+                   self.park_state == 'active')
+        return [(self.name, 0 if grabbed else 1)]
 
     def get_trapq(self):
         return None
@@ -402,7 +405,7 @@ class FakeToolhead(object):
         return 0.0
 
     def check_busy(self, eventtime):
-        return 0.0, 0.0, False
+        return 0.0, 0.0, True
 
     def flush_step_generation(self):
         return None

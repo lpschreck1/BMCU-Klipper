@@ -130,15 +130,38 @@ class PathTest(unittest.TestCase):
 
     def test_coil_frequency(self):
         world, _, bmcu = head_with_two_sources()
+        world.heads[2].heater.temp = 230.0
         world.insert(bmcu, tip=bmcu.gears_p + 5)
         self.assertEqual(world.coil_freq(2), W.BASELINE_COIL)   # nothing gripped yet
-        world.heads[2].last_grip_at = 1.0
+        world.gear_move(2, 10.0)
         self.assertGreaterEqual(world.coil_freq(2) - W.BASELINE_COIL, 400)
-        bmcu.quality = 'deformed'
+        world.step(2.0)                                         # the reading decays
+        self.assertEqual(world.coil_freq(2), W.BASELINE_COIL)
+
+    def test_deformed_tip_is_missed_by_the_gears(self):
+        world, _, bmcu = head_with_two_sources()
+        world.heads[2].heater.temp = 230.0
+        world.insert(bmcu, quality='deformed', tip=bmcu.sensor_p + 1)
+        bmcu.assisting = True
+        moved, _ = world.gear_move(2, 40.0)       # carried up to the gears, then missed
+        self.assertAlmostEqual(bmcu.tip, bmcu.gears_p)
         self.assertLess(world.coil_freq(2) - W.BASELINE_COIL, 100)
-        bmcu.quality = 'good'
+
+    def test_clog_is_missed_and_blocks_flow(self):
+        world, _, bmcu = head_with_two_sources()
+        world.heads[2].heater.temp = 230.0
         world.heads[2].clog = True
+        world.insert(bmcu, tip=bmcu.gears_p + 5)
+        _, flow = world.gear_move(2, 20.0)
+        self.assertEqual(flow, 0.0)
         self.assertLess(world.coil_freq(2) - W.BASELINE_COIL, 100)
+
+    def test_unassisted_tip_before_the_gears_is_not_carried(self):
+        world, _, bmcu = head_with_two_sources()
+        world.heads[2].heater.temp = 230.0
+        world.insert(bmcu, tip=bmcu.sensor_p + 1)
+        moved, _ = world.gear_move(2, 40.0)
+        self.assertEqual(moved, 0.0)
 
 
 class HeaterTest(unittest.TestCase):

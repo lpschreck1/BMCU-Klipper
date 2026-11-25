@@ -22,7 +22,7 @@ class SimReactor(_support.FakeReactor):
         self.pause_depth = 0
 
     # -- Klipper reactor API -------------------------------------------------
-    def register_timer(self, callback, waketime=_support.FakeReactor.NOW):
+    def register_timer(self, callback, waketime=_support.FakeReactor.NEVER):
         timer = {'callback': callback, 'waketime': waketime, 'active': True,
                  'seq': self._seq}
         self._seq += 1
