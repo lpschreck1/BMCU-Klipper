@@ -128,7 +128,11 @@ class DeformedTip(Fault):
         sim.world.sources[self.source].quality = 'deformed'
 
     def clear(self, sim):
-        sim.world.sources[self.source].quality = 'good'
+        # MODEL: the user trims the tip and hand-feeds the filament through, as for a clog
+        source = sim.world.sources[self.source]
+        source.quality = 'good'
+        if source.tip is not None and source.tip >= source.sensor_p:
+            sim.world._apply(source, source.nozzle_p - 2.0 - source.tip)
 
 
 class Runout(Fault):
