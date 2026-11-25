@@ -637,7 +637,8 @@ class AdoptIdentifiedRouteTest(unittest.TestCase):
 
     def test_records_loaded_route(self):
         self.manager._adopt_identified_u1_route(self.device, 1, object(), 2)
-        self.assertEqual(self.calls, ['lock', 'exclusive', ('mark_loaded', 1), 'hold',
+        # the hold (and its stock-feeder baseline) comes before the route reads LOADED
+        self.assertEqual(self.calls, ['lock', 'exclusive', 'hold', ('mark_loaded', 1),
                                       'commit', 'status', 'save', 'unlock'])
         self.assertEqual(self.manager.loaded_tools, {('bmcu0', 1): 5})
 
@@ -646,7 +647,7 @@ class AdoptIdentifiedRouteTest(unittest.TestCase):
         with self.assertRaises(M.BMCUError):
             self.manager._adopt_identified_u1_route(self.device, 1, object(), 2)
         self.assertIn(('bmcu0', 1), self.manager._uncertain_routes)
-        self.assertNotIn('hold', self.calls)
+        self.assertNotIn('commit', self.calls)
         self.assertEqual(self.calls[-1], 'unlock')
 
 
@@ -798,6 +799,61 @@ class StaleRecoveryTest(unittest.TestCase):
         self.assertEqual(calls, ['lock', 'unlock'])
         finish.assert_not_called()
         self.assertIn('already LOADED', '\n'.join(logs.output))
+
+
+class StockPrintFlushCapTest(unittest.TestCase):
+    """F1: a stock-profile print that first unloads BMCU filament from the Head must
+    not let the flush pull the new stock filament back by the unload length."""
+    def test_cap_applied_at_print_start(self):
+        endpoint = u1_endpoint({}, 'preload_finish')
+        endpoint._clear_stale_native_head_presence = mock.Mock()
+        endpoint._limit_native_flush_retract = mock.Mock()
+        endpoint.prepare_native_stock_load(printing=True)
+        endpoint._limit_native_flush_retract.assert_called_once_with()
+        endpoint._clear_stale_native_head_presence.assert_called_once()
+
+    def test_not_outside_a_print(self):
+        endpoint = u1_endpoint({}, 'preload_finish')
+        endpoint._limit_native_flush_retract = mock.Mock()
+        endpoint.prepare_native_stock_load(printing=False)
+        endpoint._limit_native_flush_retract.assert_not_called()
+
+
+class BackgroundHandbackLocksTest(unittest.TestCase):
+    """F4: a background job handing back its own Head isn't refused by the locks it
+    holds itself; anyone else's lock still refuses."""
+    def test_own_locks_recognised(self):
+        m = manager_stub()
+        endpoint = types.SimpleNamespace(name='u1_head3')
+        m._u1_ownership_self_job = {'locked': True, 'endpoint': endpoint}
+        self.assertTrue(m._u1_self_job_holds_locks(endpoint))
+        m._u1_ownership_self_job = {'locked': False, 'endpoint': endpoint}
+        self.assertFalse(m._u1_self_job_holds_locks(endpoint))
+        m._u1_ownership_self_job = {'locked': True, 'endpoint': types.SimpleNamespace(name='u1_head2')}
+        self.assertFalse(m._u1_self_job_holds_locks(endpoint))
+        m._u1_ownership_self_job = None
+        self.assertFalse(m._u1_self_job_holds_locks(endpoint))
+
+
+class ArrivalFailureHintTest(unittest.TestCase):
+    """F2: a load that runs its full distance names what to check."""
+    def test_shared_head_names_the_other_sources(self):
+        m = manager_stub()
+        dev = types.SimpleNamespace(name='bmcu0')
+        m._assigned_routes_for_endpoint = lambda name: [(dev, 0), (dev, 1)]
+        m._channel_record = lambda d, c: {'autoload_mm': 1600.0}
+        hint = m._arrival_failure_hint(types.SimpleNamespace(name='u1_head2'), dev, 0)
+        self.assertIn('bmcu0 Channel 2 (autoload 160 cm)', hint)
+        self.assertIn('parked past the splitter', hint)
+        self.assertTrue(hint.endswith('Clear it, then Resume'))
+
+    def test_single_source_head(self):
+        m = manager_stub()
+        dev = types.SimpleNamespace(name='bmcu0')
+        m._assigned_routes_for_endpoint = lambda name: [(dev, 2)]
+        hint = m._arrival_failure_hint(types.SimpleNamespace(name='u1_head0'), dev, 2)
+        self.assertNotIn('splitter', hint)
+        self.assertIn('snag', hint)
 
 
 if __name__ == '__main__':

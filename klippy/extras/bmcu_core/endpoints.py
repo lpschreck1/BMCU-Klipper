@@ -2277,10 +2277,12 @@ class SnapmakerU1Endpoint(Endpoint):
 
     def prepare_native_stock_load(self, printing=True):
         """Before Snapmaker's stock load at print start: clear a lagging head-sensor
-        report so Snapmaker's load doesn't skip its push."""
+        report so Snapmaker's load doesn't skip its push, and keep the flush from
+        retracting the new filament by the length BMCU just unloaded."""
         _module, channel = self.native_feeder_target()
         if printing:
             self._clear_stale_native_head_presence(channel)
+            self._limit_native_flush_retract()
 
     def native_feeder_load(self, printing=True):
         module, channel = self.native_feeder_target()

@@ -6232,11 +6232,15 @@ class BMCUManager(object):
         if endpoint is None or endpoint.driver != 'snapmaker_u1':
             return False
         path_group = endpoint.shared_path_group()
-        if (endpoint.name in self.endpoint_locks or
-                path_group in self.path_locks):
-            raise BMCUError('%s has an active transition or path lock' % endpoint.name)
-        self.endpoint_locks.add(endpoint.name)
-        self.path_locks.add(path_group)
+        # A background job handing back its own Head already holds that Head's
+        # locks; they are its locks, not a competing transition.
+        job_holds_locks = self._u1_self_job_holds_locks(endpoint)
+        if not job_holds_locks:
+            if (endpoint.name in self.endpoint_locks or
+                    path_group in self.path_locks):
+                raise BMCUError('%s has an active transition or path lock' % endpoint.name)
+            self.endpoint_locks.add(endpoint.name)
+            self.path_locks.add(path_group)
         record = self._u1_ownership_record(endpoint.name)
         original_record = copy.deepcopy(record)
         restore_disabled = None
@@ -6349,8 +6353,16 @@ class BMCUManager(object):
                         endpoint.name)
             raise
         finally:
-            self.endpoint_locks.discard(endpoint.name)
-            self.path_locks.discard(path_group)
+            if not job_holds_locks:
+                self.endpoint_locks.discard(endpoint.name)
+                self.path_locks.discard(path_group)
+
+    def _u1_self_job_holds_locks(self, endpoint):
+        job = getattr(self, '_u1_ownership_self_job', None)
+        if not isinstance(job, dict) or not job.get('locked'):
+            return False
+        owner = job.get('endpoint')
+        return owner is endpoint or getattr(owner, 'name', owner) == endpoint.name
 
     def _u1_tail_detached_matches(self, endpoint, device, channel):
         if (endpoint is None or endpoint.driver != 'snapmaker_u1' or
@@ -12725,9 +12737,11 @@ class BMCUManager(object):
                 if partial_prestage:
                     arrival['continued_from_neutral_precharge'] = True
                 if not arrival.get('ok'):
-                    raise BMCUError('ENDPOINT_NOT_REACHED: %s after %.1f mm' %
+                    raise BMCUError('ENDPOINT_NOT_REACHED: %s after %.1f mm%s' %
                                     (arrival.get('reason'),
-                                     arrival.get('measured_mm', 0.0)))
+                                     arrival.get('measured_mm', 0.0),
+                                     self._arrival_failure_hint(
+                                         endpoint, device, channel)))
                 if (configured_entry_sensor and
                         not arrival.get('sensor_triggered')):
                     raise BMCUError(
@@ -16122,6 +16136,25 @@ class BMCUManager(object):
             return False           # the stock feeder's own load
         return True
 
+    def _arrival_failure_hint(self, endpoint, device, channel):
+        """What to check when a load didn't reach the Head, for the pause message."""
+        others = [(d, c) for d, c in self._assigned_routes_for_endpoint(endpoint.name)
+                  if not (d is device and int(c) == int(channel))]
+        hint = ('. Check the path for a snag or kink, and that the tip is cut clean')
+        if others:
+            names = []
+            for d, c in others:
+                try:
+                    autoload = self._channel_record(d, c).get('autoload_mm')
+                    names.append('%s Channel %d (autoload %.0f cm)' %
+                                 (d.name, int(c) + 1, float(autoload) / 10.0))
+                except (TypeError, ValueError):
+                    names.append('%s Channel %d' % (d.name, int(c) + 1))
+            hint += ('; this Head is shared, so also check that no other source\'s '
+                     'filament is parked past the splitter (%s: autoload must be '
+                     'shorter than its tube to the splitter)' % ', '.join(names))
+        return hint + '. Clear it, then Resume'
+
     def _u1_should_identify_before_load(self, endpoint, prefetched=False):
         """During a print, before loading into a U1 Head: is there filament at its
         sensor that BMCU must identify first? Not for BMCU's own staged filament
@@ -16246,15 +16279,18 @@ class BMCUManager(object):
                 raise BMCUError('%s Channel %d buffer calibration is invalid' %
                                 (device.name, channel + 1))
             self._require_exclusive_endpoint_route(device, endpoint, channel)
+            # Arm the hold first, as a normal load does: it captures the stock
+            # feeder's baseline while BMCU doesn't yet own the path, which it
+            # refuses to do once the route reads LOADED.
+            self._arm_u1_persistent_hold(
+                endpoint, device, channel,
+                'filament identified in Head %d' % (head + 1))
             device.mark_loaded(channel)
             current = dict(device.refresh())
             if self._route_states_from_status(current)[channel] != protocol.ROUTE_LOADED:
                 self._uncertain_routes.add(route_key)
                 raise BMCUError('%s Channel %d did not confirm LOADED' %
                                 (device.name, channel + 1))
-            self._arm_u1_persistent_hold(
-                endpoint, device, channel,
-                'filament identified in Head %d at print start' % (head + 1))
             self._commit_u1_route_ownership(device, channel, protocol.ROUTE_LOADED)
             self._uncertain_routes.discard(route_key)
             self.device_status_changed(device, previous, current)
