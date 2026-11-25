@@ -250,7 +250,7 @@ class FakePrinter(object):
     def __init__(self, reactor, state_dir=''):
         self.reactor = reactor
         self.objects = {}
-        self.handlers = {}
+        self.event_handlers = {}
         self.start_args = {'config_file': (state_dir + '/printer.cfg')
                            if state_dir else ''}
         self.events = []
@@ -283,12 +283,12 @@ class FakePrinter(object):
                 if name == module or name.startswith(prefix)]
 
     def register_event_handler(self, event, callback):
-        self.handlers.setdefault(event, []).append(callback)
+        self.event_handlers.setdefault(event, []).append(callback)
 
     def send_event(self, event, *params):
         self.events.append((event,) + params)
         results = []
-        for callback in list(self.handlers.get(event, [])):
+        for callback in list(self.event_handlers.get(event, [])):
             results.append(callback(*params))
         return results
 

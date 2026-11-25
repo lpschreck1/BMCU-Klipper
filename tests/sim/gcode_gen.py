@@ -163,3 +163,28 @@ def build(plan, materials=None, colors=None, temps=None, extrude_per_segment=5,
                        for i in range(5))
     out.append(end_gcode())
     return '\n'.join(out) + '\n'
+
+
+def build_stock(plan, temps=None, extrude_per_segment=5):
+    """A print sliced with Snapmaker's own profile: no BMCU commands at all. ``plan`` is
+    ``[[3], [3]]``-style (stock tools only, no changes between heads)."""
+    temps = dict(temps or {})
+    tools = sorted(set(t for layer in plan for t in layer))
+    initial = plan[0][0]
+    temp = temps.get(initial, 220)
+    out = ['; nozzle_temperature = %s' % ','.join(str(temps.get(t, 220)) for t in range(8)),
+           'PRINT_START', 'M104 T%d S140' % initial, 'G28 X Y', 'T%d' % initial,
+           'SM_PRINT_CHECK_SWITCH_EXTRUDER']
+    for tool in tools:
+        out.append('SM_PRINT_EXTRUDER_PREHEAT EXTRUDER=%d TEMP=140' % tool)
+        out.append('SM_PRINT_AUTO_FEED EXTRUDER=%d' % tool)
+    out += ['M104 T%d S%d' % (initial, temp), 'G28 Z', 'M83']
+    for layer_index, layer_tools in enumerate(plan):
+        out.append(';LAYER_CHANGE')
+        out.append('G92 E0')
+        for _tool in layer_tools:
+            out.extend('G1 X%d Y%d E%.2f F1800' % (100 + i * 2, 100 + layer_index,
+                                                    extrude_per_segment / 5.0)
+                       for i in range(5))
+    out += ['PRINT_END', 'TIMELAPSE_STOP']
+    return chr(10).join(out) + chr(10)

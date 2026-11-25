@@ -67,6 +67,11 @@ class Sim(object):
         self.bmcu = None
         self.manager = None
         self.booted = False
+        self.pending_faults = []      # (trigger, fault)
+        self.watchers = []
+        self.active_faults = []
+        self.fired = []               # (virtual time, fault name, trigger) log
+        self.gcode.on_dispatch = self._on_dispatch
         if bmcu:
             from . import bmcu_host
             bmcu_host.attach(self, with_device=(bmcu is True))
@@ -225,6 +230,21 @@ class Sim(object):
         self.gcode_text = text
         return path
 
+    def slice_stock(self, plan, **kwargs):
+        """A print sliced with Snapmaker's own profile (no BMCU commands)."""
+        from . import gcode_gen
+        text = gcode_gen.build_stock(plan, **kwargs)
+        path = os.path.join(self.tmp, 'stock.gcode')
+        with open(path, 'w') as stream:
+            stream.write(text)
+        self.sdcard.load(path, text)
+        cfg = self.print_task_config.print_task_config
+        for tool in set(t for layer in plan for t in layer):
+            cfg['extruders_used'][tool] = True
+            cfg['reprint_info']['extruders_used'][tool] = True
+        self.gcode_text = text
+        return path
+
     def start_print(self):
         self.run_gcode('SDCARD_PRINT_FILE')
 
@@ -240,6 +260,45 @@ class Sim(object):
     def run_print(self):
         self.start_print()
         return self.run_until_stopped()
+
+    def start(self):
+        """Start the print without waiting for it."""
+        self.start_print()
+
+    # -- fault injection -----------------------------------------------------------
+    def inject(self, at, fault):
+        """Apply ``fault`` just before the G-code line that ``at`` (a trigger) matches."""
+        self.pending_faults.append((at, fault))
+
+    def watch(self, prefix, callback):
+        """Call ``callback(sim, commandline)`` just before each line starting with ``prefix``."""
+        self.watchers.append((prefix.upper(), callback))
+
+    def _on_dispatch(self, command, commandline):
+        for prefix, callback in list(self.watchers):
+            if commandline.upper().startswith(prefix):
+                callback(self, commandline)
+        for item in list(self.pending_faults):
+            trigger, fault = item
+            if trigger.matches(command, commandline, self):
+                self.pending_faults.remove(item)
+                if hasattr(trigger, 'fired'):
+                    trigger.fired = True
+                fault.apply(self)
+                self.active_faults.append(fault)
+                self.fired.append((round(self.world.now, 1), fault.name, commandline))
+
+    def run_until_pause(self, limit=7200.0):
+        """Run until the print pauses, fails or completes; returns a Result."""
+        state = self.run_until_stopped(limit)
+        return Result(state, self.print_stats.message)
+
+    def run_to_end(self, limit=7200.0):
+        return self.run_until_pause(limit)
+
+    @property
+    def print_state(self):
+        return self.print_stats.state
 
     @property
     def user(self):
@@ -264,6 +323,15 @@ class Sim(object):
             shutil.rmtree(self.tmp, ignore_errors=True)
 
 
+class Result(object):
+    def __init__(self, state, message):
+        self.state = state
+        self.message = message
+
+    def __repr__(self):
+        return 'Result(%s, %r)' % (self.state, self.message)
+
+
 class User(object):
     """What the human does at the screen."""
 
@@ -275,6 +343,12 @@ class User(object):
         sim = self.sim
         sim.run_gcode('RESUME')
         return sim.run_until_stopped(limit)
+
+    def clear_fault(self):
+        """The human fixes what is physically wrong: every active fault is cleared."""
+        for fault in list(self.sim.active_faults):
+            fault.clear(self.sim)
+        self.sim.active_faults = []
 
     def cancel(self):
         self.sim.run_gcode('CANCEL_PRINT')

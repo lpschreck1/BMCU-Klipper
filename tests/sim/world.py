@@ -192,17 +192,19 @@ class World(object):
         """Raw entry-switch state: any tip past the entry sensor."""
         return any(s.past(s.sensor_p) for s in self.heads[head].sources)
 
+    COIL_ZONE_MM = 30.0
+
     def coil_freq(self, head):
-        """Coil frequency at the gears. # MODEL: the coil sees a good grab (about
-        +1000) for 1.5 s after the gears last moved filament; a clog, a deformed tip
-        or no recent motion stays near baseline (plan 3.2: a miss is under 100)."""
+        """Coil frequency. # MODEL: the coil responds to filament in the nozzle zone (the
+        last ``COIL_ZONE_MM`` before the nozzle): about +1000 over the baseline there, and
+        near baseline anywhere else (plan 3.2: a good grab is ~1000, a miss under 100). A
+        clog or a deformed tip never gets the filament into the zone. The reading is a
+        state, so a filament the user pushes through by hand also reads high."""
         item = self.heads[head]
+        for source in item.sources:
+            if source.tip is not None and source.tip >= source.nozzle_p - self.COIL_ZONE_MM:
+                return BASELINE_COIL + COIL_GOOD_DELTA
         if item.clog:
-            return BASELINE_COIL + COIL_MISS_DELTA
-        if item.last_grip_at is not None and self.now - item.last_grip_at <= 1.5:
-            return BASELINE_COIL + COIL_GOOD_DELTA
-        source = self.head_filament(head)
-        if source is not None and source.in_gears and source.quality != 'good':
             return BASELINE_COIL + COIL_MISS_DELTA
         return BASELINE_COIL
 
@@ -305,6 +307,12 @@ class World(object):
                 item.last_grip_at = self.now
             at_nozzle = source.tip >= source.nozzle_p - 1e-9
             flow = remaining if at_nozzle and not item.clog else 0.0
+            if flow:
+                # the filament keeps being consumed at the nozzle: the plastic leaves, the
+                # spool and the encoder behind it still move
+                source.encoder_mm += flow
+                source.spool_mm = max(0.0, source.spool_mm - flow)
+                moved += flow
             item.extruded_mm += flow
             if step + 1e-9 < remaining and not at_nozzle:
                 source.stalled = True

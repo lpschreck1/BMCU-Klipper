@@ -395,7 +395,9 @@ class SnapmakerMacros(object):
     def cmd_G28(self, gcmd):
         params = gcmd.get_command_parameters()
         axes = ''.join(a.lower() for a in 'XYZ' if a in params) or 'xyz'
+        self.sim.printer.send_event('homing:homing_move_begin', None)
         self.spend(4.0)
+        self.sim.printer.send_event('homing:homing_move_end', None)
         homed = self.sim.toolhead.homed_axes
         self.sim.toolhead.homed_axes = ''.join(sorted(set(homed) | set(axes)))
         self.log.append('G28 ' + axes)
@@ -411,6 +413,8 @@ class SnapmakerMacros(object):
             self.park(toolhead.active)
             self.spend(3.0)
             toolhead.active = head
+        else:
+            self.spend(1.0)               # MODEL: re-selecting the active head still moves
         self.sim.extruders[head].park_state = 'active'
         self.log.append('T%d' % head)
 
@@ -460,14 +464,20 @@ class SnapmakerMacros(object):
         for ext in self.sim.extruders:
             ext.heater.set_target(0.0)
 
+    IDLE_XY = (30.0, 5.0)
+
     def cmd_move_idle(self, gcmd):
         self.spend(2.0)
-        self.sim.toolhead.position[0:2] = [30.0, 5.0]
+        self.sim.toolhead.position[0:2] = [
+            self.IDLE_XY[0] + gcmd.get_float('X_OFFSET', 0.0),
+            self.IDLE_XY[1] + gcmd.get_float('Y_OFFSET', 0.0)]
         self.log.append('MOVE_TO_XY_IDLE_POSITION_EXTRUDER')
 
     def cmd_move_discard(self, gcmd):
-        self.spend(2.0)
-        self.sim.toolhead.position[0:2] = [30.0, 5.0]
+        # fluidd.cfg: the idle position plus X_OFFSET=3.5/-1.5 and Y_OFFSET=50.5
+        x_offset = 3.5 if self.sim.toolhead.active == 0 else -1.5
+        self.g.run_script_from_command(
+            'MOVE_TO_XY_IDLE_POSITION_EXTRUDER X_OFFSET=%s Y_OFFSET=50.5' % x_offset)
         self.log.append('MOVE_TO_DISCARD_FILAMENT_POSITION')
 
     def cmd_SET_ACTION_CODE(self, gcmd):

@@ -132,10 +132,10 @@ class PathTest(unittest.TestCase):
         world, _, bmcu = head_with_two_sources()
         world.heads[2].heater.temp = 230.0
         world.insert(bmcu, tip=bmcu.gears_p + 5)
-        self.assertEqual(world.coil_freq(2), W.BASELINE_COIL)   # nothing gripped yet
-        world.gear_move(2, 10.0)
+        self.assertEqual(world.coil_freq(2), W.BASELINE_COIL)        # not yet near the nozzle
+        world.gear_move(2, 50.0)                                     # into the nozzle zone
         self.assertGreaterEqual(world.coil_freq(2) - W.BASELINE_COIL, 400)
-        world.step(2.0)                                         # the reading decays
+        world.pull(bmcu, 100.0)                                      # backed out again
         self.assertEqual(world.coil_freq(2), W.BASELINE_COIL)
 
     def test_deformed_tip_is_missed_by_the_gears(self):
