@@ -119,6 +119,13 @@ class Sim(object):
                 self.gcode.register_command(name, lambda gcmd: None)
         self.sdcard = V.VirtualSDCard(self)
         p.add_object('virtual_sdcard', self.sdcard)
+        for head in range(4):
+            fan = Stub(speed=0.0)
+            fan.get_status = lambda eventtime=None, f=fan: {'speed': f.speed}
+            p.add_object('fan' if head == 0 else 'fan_generic e%d_fan' % head, fan)
+            p.add_object('heater_fan e%d_nozzle_fan' % head, Stub(
+                probe_speed=1.0, fan_speed=1.0, original_fan_speed=None, last_speed=0,
+                current_stepped_index=0, fan_timer=None))
         p.add_object('idle_timeout', Stub())
         p.add_object('buttons', Stub())
         p.add_object('stepper_enable', Stub(lookup_enable=lambda name: Stub(
@@ -144,12 +151,48 @@ class Sim(object):
         channel = F.FEEDERS[module].index(head)
         self.feeders[module].port_changed(channel)
 
-    def setup_u1(self):
-        """Preset, routes (channels 1-2 -> head 3, 3-4 -> head 4) and spools."""
+    def setup_u1(self, early_park=False):
+        """Preset, routes (channels 1-2 -> head 3, 3-4 -> head 4).
+
+        # MODEL: the early-park tip tail (``BMCU_PARK_HEAD``) drives Klipper's C step
+        # generator through chelper and is not simulated. Unless ``early_park`` the tip
+        # profile is Snapmaker's own movements, which have no marker: tip forming runs
+        # attached, then the head is parked for the long pullback (endpoints.py:3899).
+        """
+        from bmcu_core import endpoints as E
         self.run_gcode('BMCU_APPLY_PRESET PRESET=snapmaker_u1')
+        head = self.world.heads[2]
+        full = (1500.0 + head.shared + head.sensor_to_gears + head.gears_to_nozzle + 60.0)
+        for channel in range(4):
+            self.run_gcode(
+                'BMCU_SET_FILAMENT DEVICE=bmcu0 CHANNEL=%d UNLOAD_RETRACT_MM=%d '
+                'AUTOLOAD_MM=1200' % (channel, min(2000, int(full))))
+        if not early_park and self.manager is not None:
+            profile = E.u1_tip_profile_defaults()
+            profile['movements'] = E.u1_tip_snapmaker_movement_defaults()
+            self.manager.state.data['u1_tip_profiles'] = {'default': profile}
         for channel, head in self.channel_head.items():
             self.run_gcode('BMCU_SET_OUTPUT DEVICE=bmcu0 CHANNEL=%d ENDPOINT=u1_head%d'
                            % (channel, head))
+
+    COLORS = {'red': 'FF0000', 'black': '101010', 'white': 'FFFFFF', 'blue': '0000FF',
+              'green': '00AA00', 'yellow': 'FFFF00'}
+
+    def load_spools(self, spools):
+        """``{tool: 'PLA red'}``: T0-T3 are stock spools in that head's feeder, T4-T7
+        are BMCU channels 1-4. Sets the material and colour the plan will check."""
+        for tool, text in sorted(spools.items()):
+            material, _, color = text.partition(' ')
+            if tool >= 4:
+                channel = tool - 4
+                self.insert_bmcu(channel)
+                self.run_gcode(
+                    'BMCU_SET_FILAMENT DEVICE=bmcu0 CHANNEL=%d MATERIAL=%s COLOR=%s' %
+                    (channel, material, self.COLORS.get(color, 'FFFFFF')))
+            else:
+                self.insert_stock(tool)
+                self.print_task_config.set_head(tool, ftype=material)
+        self.settle(70.0)
 
     def insert_bmcu(self, channel, **kwargs):
         """The user puts a spool on a BMCU channel."""
