@@ -92,7 +92,7 @@ class HeadSensorLagTest(StockTestBase):
         self.sim.settle(1.0)
         self.assertFalse(sensor.runout_buttun_state)               # the switch opened
         self.assertTrue(sensor.runout_helper.filament_present)     # but the report lags
-        self.sim.extruders[HEAD].total_e += 8.0                    # detection_length of motion
+        self.sim.extruders[HEAD].e_position += 8.0                 # detection_length of motion
         self.sim.settle(1.0)
         self.assertFalse(sensor.runout_helper.filament_present)
 

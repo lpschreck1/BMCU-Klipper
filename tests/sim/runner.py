@@ -345,6 +345,13 @@ class Sim(object):
     # raises it from the file's own tool-change count).
     run_limit = 7200.0
 
+    def pending_runout_head(self):
+        """The Head whose stock runout pause is queued, if any (see RunoutHelper)."""
+        for head in sorted(self.sensors):
+            if self.sensors[head].runout_helper.runout_pending:
+                return head
+        return None
+
     def run_until_stopped(self, limit=None):
         """Advance until the print completes, pauses or fails. Returns the state, or
         ``'restarted'`` if the machine was restarted on the way (see ``restart``)."""

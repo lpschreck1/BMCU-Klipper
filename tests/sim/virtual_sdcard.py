@@ -151,6 +151,16 @@ class VirtualSDCard(object):
                 self.run_log.append(line)
                 sim.gcode.run_script(line)
                 self.current_line_gcode = line
+                runout = sim.pending_runout_head()
+                if runout is not None:
+                    # the queued runout pause runs after the command that was in
+                    # progress, and auto replenish has no spare here
+                    self.file_position = self.next_file_position
+                    sim.sensors[runout].runout_helper.runout_pending = False
+                    error_message = 'e%d_filament runout' % runout
+                    action = 'pause_runout'
+                    sim.gcode.run_script('PAUSE IS_RUNOUT=1')
+                    break
             except K.CommandError as exc:
                 error_message = str(exc)
                 action = exc.action

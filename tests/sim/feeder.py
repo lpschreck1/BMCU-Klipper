@@ -47,12 +47,33 @@ class Motor(object):
 
 
 class RunoutHelper(object):
-    def __init__(self):
+    """filament_switch_sensor.RunoutHelper, as far as a runout pause goes.
+
+    A switch that opens while printing (or the motion sensor running out of
+    detection_length) is a runout event: Snapmaker queues PAUSE IS_RUNOUT=1, which
+    runs once the command in progress finishes (virtual_sdcard checks
+    ``runout_pending``), then tries auto replenish. Events are ignored while one is
+    pending (min_event_systime = NEVER)."""
+
+    def __init__(self, sim=None, head=None):
+        self.sim = sim
+        self.head = head
         self.filament_present = False
         self.sensor_enabled = True
+        self.runout_pending = False
+        self.runout_events = 0
 
     def note_filament_present(self, state, force=False):
-        self.filament_present = bool(state)
+        state = bool(state)
+        if state == self.filament_present and not force:
+            return
+        self.filament_present = state
+        if (state or self.sim is None or self.runout_pending or
+                not self.sensor_enabled):
+            return
+        if self.sim.print_stats.state == 'printing':
+            self.runout_pending = True
+            self.runout_events += 1
 
     def get_status(self, eventtime=None):
         return {'filament_detected': bool(self.filament_present),
@@ -70,12 +91,22 @@ class MotionSensor(object):
     def __init__(self, sim, head):
         self.sim = sim
         self.head = head
-        self.runout_helper = RunoutHelper()
+        self.runout_helper = RunoutHelper(sim, head)
         self.runout_buttun_state = False
         self.filament_runout_pos = None
         self._extruder_pos_update_timer = sim.reactor.register_timer(
             self._extruder_pos_update_event, sim.reactor.NEVER)
         self._last_switch = False
+        sim.printer.register_event_handler(
+            'print_stats:start', self._handle_start_print_job)
+
+    def _handle_start_print_job(self):
+        # 2.1.0: a Head whose switch is open when the print starts gets a fast
+        # runout, 0.2 mm of its extruder's motion (seen on the real U1 2026-11-26)
+        if not self.runout_buttun_state:
+            self.filament_runout_pos = self.sim.extruders[self.head].e_position + 0.2
+            self.sim.reactor.update_timer(self._extruder_pos_update_timer,
+                                          self.sim.reactor.NOW)
 
     def get_status(self, eventtime=None):
         return self.runout_helper.get_status(eventtime)
@@ -106,14 +137,14 @@ class MotionSensor(object):
                 reactor.update_timer(self._extruder_pos_update_timer, reactor.NOW)
                 lag = self.sim.world.heads[self.head].sensor_lag_mm
                 self.filament_runout_pos = (
-                    self.sim.extruders[self.head].total_e +
+                    self.sim.extruders[self.head].e_position +
                     (self.detection_length if lag is None else lag))
         else:
             self.runout_helper.note_filament_present(state)
             reactor.update_timer(self._extruder_pos_update_timer, reactor.NEVER)
 
     def _extruder_pos_update_event(self, eventtime):
-        if self.sim.extruders[self.head].total_e >= (self.filament_runout_pos or 0.0):
+        if self.sim.extruders[self.head].e_position >= (self.filament_runout_pos or 0.0):
             self.runout_helper.note_filament_present(False, True)
             return self.sim.reactor.NEVER
         return eventtime + 0.1

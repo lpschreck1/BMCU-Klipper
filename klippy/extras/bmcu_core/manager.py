@@ -2183,6 +2183,28 @@ class BMCUManager(object):
             self._critical_motion_active or
             self._critical_motion_depth)
 
+    def _wait_critical_motion_released(self, timeout=None):
+        """Wait out the release delay after homing or probing has ended.
+
+        Snapmaker's resume runs G28 X Y (with its probing) and then the tool select
+        and SM_PRINT_AUTO_FEED at once, inside the critical_motion_release_delay
+        window. Work that refuses to run during printer motion would then fail on
+        every Resume (2026-11-26). Only that lingering window is waited out: if motion
+        is really in progress (depth > 0) this returns at once."""
+        active = lambda: bool(getattr(self, '_critical_motion_active', False) or
+                              getattr(self, '_critical_motion_pending', False))
+        depth = lambda: int(getattr(self, '_critical_motion_depth', 0) or 0)
+        if not active() or depth():
+            return not (active() or depth())
+        if timeout is None:
+            timeout = float(getattr(self, 'critical_motion_release_delay', 0.5)) + 2.0
+        deadline = self.reactor.monotonic() + max(0.0, float(timeout))
+        while (active() and not depth() and
+               not getattr(self, '_klippy_disconnecting', False) and
+               self.reactor.monotonic() < deadline):
+            self.reactor.pause(self.reactor.monotonic() + 0.050)
+        return not (active() or depth())
+
     def _wait_background_control_plane(self, cancel_check=None,
                                        poll_interval=0.050):
         cancel_requested = False
@@ -6549,6 +6571,24 @@ class BMCUManager(object):
             return False
         owner = job.get('endpoint')
         return owner is endpoint or getattr(owner, 'name', owner) == endpoint.name
+
+    def _u1_bmcu_filament_short_of_head(self, endpoint, device, channel):
+        """True when this Channel still feeds from its spool but the Head sensor
+        reads empty: the filament ends upstream of the Head. Not a detached tail,
+        which is past the sensor yet still in the extruder."""
+        if getattr(endpoint, 'driver', '') != 'snapmaker_u1':
+            return False
+        if self._u1_tail_detached_matches(endpoint, device, channel):
+            return False
+        try:
+            present = device.status.get('present', [])
+            if not bool(present[channel]):
+                return False
+            snapshot = endpoint.entry_sensor_snapshot()
+        except Exception:
+            return False
+        return bool(snapshot.get('available') and snapshot.get('coherent') and
+                    snapshot.get('physical_detected') is False)
 
     def _u1_tail_detached_matches(self, endpoint, device, channel):
         if (endpoint is None or endpoint.driver != 'snapmaker_u1' or
@@ -13835,9 +13875,23 @@ class BMCUManager(object):
             context['before_pullback_started'] = True
             self.reactor.pause(self.reactor.monotonic() + 0.2)
 
+            head_empty = self._u1_bmcu_filament_short_of_head(
+                endpoint, device, channel)
+            context['head_empty_skipped_tip'] = head_empty
             if endpoint.driver == 'generic_single_extruder':
                 endpoint.prepare_toolhead_for_pullback(
                     material, reason=reason)
+                tip_result = {}
+            elif head_empty:
+                # The filament ends before the Head sensor (pulled back by hand, or a
+                # load that stopped short), so there is no tip in the extruder to
+                # form. Driving the Head extruder now only trips Snapmaker's runout
+                # check, which pauses the print once this unload is done
+                # (2026-11-26). BMCU's own pullback is enough.
+                logging.info(
+                    'BMCU %s Channel %d filament ends before the %s sensor; '
+                    'skipping tip forming and pulling back with BMCU only',
+                    device.name, channel + 1, endpoint.name)
                 tip_result = {}
             else:
                 tip_result = self._endpoint_temperature_call(
@@ -13876,7 +13930,7 @@ class BMCUManager(object):
                 endpoint.release_filament(material)
                 endpoint.verify_release(material)
                 if (endpoint.driver != 'generic_single_extruder' and
-                        self.release_retract_mm > 0):
+                        not head_empty and self.release_retract_mm > 0):
                     endpoint.extrude(
                         -self.release_retract_mm, self.release_retract_feed)
 
@@ -16199,6 +16253,7 @@ class BMCUManager(object):
         if self.active_operations or self._u1_background_jobs:
             raise BMCUError(
                 'U1 toolchange recovery cannot run while BMCU motion is active')
+        self._wait_critical_motion_released()
         if (self._critical_motion_active or self._critical_motion_depth):
             raise BMCUError(
                 'U1 toolchange recovery cannot run during printer motion')

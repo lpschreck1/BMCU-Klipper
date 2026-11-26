@@ -37,13 +37,16 @@ class U1Extruder(K.FakeExtruder):
         self.extruder_index = index
         self.nozzle_diameter = 0.4
         self.nozzle_volume_type = 'standard'
-        self.total_e = 0.0               # all extruder motion, for the sensor lag
+        self.total_e = 0.0               # all extruder motion, forward and back
+        self.e_position = 0.0            # signed, what find_past_position reports
         self.print_commanded = 0.0       # E asked for while printing (forward moves)
         self.print_flow = 0.0            # of which actually left the nozzle
         self.binding_probe = BindingProbe(sim, index)
 
     def find_past_position(self, print_time):
-        return self.total_e
+        # Klipper's extruder position is signed: a retract moves it back, so it
+        # does not count toward the runout sensor's detection_length
+        return self.e_position
 
     def get_status(self, eventtime=None):
         status = K.FakeExtruder.get_status(self, eventtime)
@@ -366,6 +369,7 @@ class GcodeMove(object):
                 extruder.print_commanded += step
                 extruder.print_flow += flow + credit
             extruder.total_e += step
+            extruder.e_position += sign * step
             sim.reactor.pause(sim.reactor.monotonic() + step / max(self.speed, 0.1))
             remaining -= step
 
@@ -483,7 +487,10 @@ class SnapmakerMacros(object):
             self.spend(3.0)
             toolhead.active = head
         else:
-            self.spend(1.0)               # MODEL: re-selecting the active head still moves
+            # MODEL: re-selecting the active head is quick. On the real U1 (2026-11-26)
+            # 'already active' and the next command land in the same second as the end
+            # of G28, inside BMCU's 0.5 s critical-motion release window.
+            self.spend(getattr(self.sim, 'reselect_s', 0.1))
         self.sim.extruders[head].park_state = 'active'
         self.log.append('T%d' % head)
 

@@ -263,8 +263,15 @@ class ForegroundSelectedPrestageTest(unittest.TestCase):
             self.skipTest('tests/sim/fixtures/real/bmcu_test_print.gcode not supplied')
         return path
 
-    def test_the_print_completes_without_a_pause(self):
+    def run_file(self):
         sim = run_file(self, self.path())
+        # The race needs the foreground's re-select of Head 3 to take a while; with
+        # the quick re-select of the real U1 the background job wins it here
+        sim.reselect_s = 1.0
+        return sim
+
+    def test_the_print_completes_without_a_pause(self):
+        sim = self.run_file()
         sim.start()
         self.assertEqual(sim.run_until_stopped(), 'complete', sim.print_stats.message)
         self.assertEqual(checks.verify(sim), [])
@@ -277,7 +284,7 @@ class ForegroundSelectedPrestageTest(unittest.TestCase):
             return False
         with mock.patch.object(M.BMCUManager, '_u1_wait_parked_or_foreground_selected',
                                old_wait):
-            sim = run_file(self, self.path())
+            sim = self.run_file()
             sim.start()
             state = sim.run_until_stopped()
         self.assertEqual(state, 'paused')

@@ -105,6 +105,58 @@ class Incident2PendingRecoveryTest(unittest.TestCase):
         self.assertIn('recovery for T4 is pending before T6', sim.print_stats.message)
 
 
+    def test_without_the_wait_resume_is_refused_right_after_homing(self):
+        sim, _ = self.first_pause()
+        sim.user.clear_fault()
+        # 2026-11-26 on the real printer: Snapmaker's resume homes X/Y and then runs
+        # the reload inside BMCU's 0.5 s release window, and every Resume failed
+        with mock.patch.object(M.BMCUManager, '_wait_critical_motion_released',
+                               lambda self, timeout=None: False):
+            with self.assertRaises(CommandError) as ctx:
+                sim.user.resume()
+        self.assertIn('cannot run during printer motion', str(ctx.exception))
+
+
+class Incident11PulledBackBeforeTheHeadTest(unittest.TestCase):
+    """2026-11-26 on the real printer: T5 (bmcu0 Channel 2) stayed recorded LOADED in
+    Head 3 after a print, and the user pulled it back behind the Head sensor. The next
+    print started with T4 on Head 3. Snapmaker arms a 0.2 mm runout on a Head whose
+    switch is open when a print starts, so BMCU's tip forming for T5 tripped it, and
+    the print paused right after T4 had loaded."""
+
+    def second_print(self):
+        sim = make_sim(self, plan=[[5]], spools={5: 'PLA red', 4: 'PLA black'})
+        # the first print's T5 load stops in Head 3 (coil check fails); the user
+        # cancels, confirms the route LOADED, then pulls T5 back behind the sensor
+        sim.inject(F.GcodeLine('BMCU_AUTO_FEED EXTRUDER=2'), F.Clog(2))
+        sim.start()
+        self.assertIn('U1_TOOLHEAD_NOT_LOADED', sim.run_until_pause().message)
+        sim.user.clear_fault()
+        sim.user.cancel()
+        self.assertEqual(sim.user.confirm_routes(), [(1, 'LOADED')])
+        source = sim.world.sources['bmcu1']
+        sim.world.pull(source, source.tip - (source.sensor_p - 30.0))
+        sim.settle(2.0)
+        self.assertFalse(sim.sensors[2].runout_buttun_state)
+        sim.slice([[4]])
+        sim.start()
+        return sim
+
+    def test_t4_loads_and_the_print_completes(self):
+        sim = self.second_print()
+        self.assertEqual(sim.run_until_stopped(), 'complete', sim.print_stats.message)
+        self.assertEqual(sim.sensors[2].runout_helper.runout_events, 0)
+        self.assertEqual(sim.world.consistent(), [])
+
+    def test_without_the_check_tip_forming_trips_the_stock_runout(self):
+        with mock.patch.object(M.BMCUManager, '_u1_bmcu_filament_short_of_head',
+                               lambda self, endpoint, device, channel: False):
+            sim = self.second_print()
+            state = sim.run_until_stopped()
+        self.assertEqual(state, 'paused')
+        self.assertIn('e2_filament runout', sim.print_stats.message)
+
+
 class Incident3FlushRetractTest(unittest.TestCase):
     """T6->T3 on head 4: BMCU's tip shaping and pullback leave printing_e_pos at about
     -67.5 mm, so Snapmaker's flush would retract the new stock filament that far and the

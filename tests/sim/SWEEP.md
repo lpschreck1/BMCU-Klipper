@@ -81,10 +81,10 @@ Outcomes: `no_effect` (finished without pausing), `resumed` (paused, fix + Resum
 | prestaging T5 | runout bmcu1 | resumed | Snapmaker background preparation failed on u1_head2: bmcu0 Channel 2 has no filament |
 | load T5 20 mm | snag bmcu1 58 mm | resumed | Snapmaker background preparation failed on u1_head2: BACKGROUND_PRESTAGE_FAILED: buffer_limit after 58.0 mm |
 | load T5 20 mm | deformed bmcu1 | resumed | U1_TOOLHEAD_NOT_LOADED: Head 3 saw no convincing downstream start-to-finish coil response during the normal BEFORE_ON_USE path (path_delta=0.0, gentle_required>=400.0) after 2 final read(s). BMCU pressure and Head motion |
-| load T5 20 mm | runout bmcu1 | resumed | Snapmaker background preparation failed on u1_head2: BACKGROUND_PRESTAGE_FAILED: no_filament after 23.7 mm |
+| load T5 20 mm | runout bmcu1 | resumed | Snapmaker background preparation failed on u1_head2: BACKGROUND_PRESTAGE_FAILED: no_filament after 20.6 mm |
 | load T4 20 mm | snag bmcu0 58 mm | resumed | ENDPOINT_NOT_REACHED: buffer_limit after 58.0 mm. Check the path for a snag or kink, and that the tip is cut clean; this Head is shared, so also check that no other source's filament is parked past the splitter (bmcu0 Ch |
 | load T4 20 mm | deformed bmcu0 | resumed | U1_TOOLHEAD_NOT_LOADED: Head 3 saw no convincing downstream start-to-finish coil response during the normal BEFORE_ON_USE path (path_delta=0.0, gentle_required>=400.0) after 2 final read(s). BMCU pressure and Head motion |
-| load T4 20 mm | runout bmcu0 | resumed | ENDPOINT_NOT_REACHED: no_filament after 23.7 mm. Check the path for a snag or kink, and that the tip is cut clean; this Head is shared, so also check that no other source's filament is parked past the splitter (bmcu0 Cha |
+| load T4 20 mm | runout bmcu0 | resumed | ENDPOINT_NOT_REACHED: no_filament after 22.2 mm. Check the path for a snag or kink, and that the tip is cut clean; this Head is shared, so also check that no other source's filament is parked past the splitter (bmcu0 Cha |
 
 **9 cases, 0 no effect, 9 resumed, 0 stuck.**
 
