@@ -61,6 +61,26 @@ A fix is proved with a **negative control**: rerun the scenario with the fix dis
 `mock.patch.object` and assert it fails the way the incident did. A bug the simulator finds
 is an `@unittest.expectedFailure` test plus a `FINDINGS.md` row, not a fix.
 
+## Restarts and the power-loss resume (M9)
+
+`sim.restart('klipper'|'power', at=trigger)` throws away the fake Klipper, the Snapmaker
+modules and the BMCU manager and rebuilds them over the same `World` and `state_dir`
+(`run_until_stopped()` then returns `'restarted'`). `'klipper'` keeps the BMCU helper and
+firmware running (they are rebound to the new reactor) and loses queued durable writes
+(`sim.bmcu.write_lag` makes writes land late); `'power'` also restarts the firmware (route
+states persist like flash, the encoder counter restarts), freezes the world at that instant,
+and cools the heaters. `corrupt_state='empty'|'truncated'` damages `bmcu_state.json` before the
+boot. `sim.power_loss_restore()` is the user tapping resume; `sim.reload_print()` selects the file
+again after a Klipper restart; `User.confirm_routes()` is the panel's `BMCU_ROUTE_CONFIRM`.
+
+The power-loss resume is modelled from Snapmaker's `virtual_sdcard.py` (`main` branch: no
+2.1.0 tag is published): a cut `G0-G3` line is assumed finished, any other line (a macro, a
+tool change) runs again, `T<n> A0` re-selects the extruder, heater targets come back, and a
+pre-extrude runs when the head is hot. **Left out**: Z and the z-hop compensation, bed mesh,
+fans, pressure advance, purifier, exclude-object state, flow/speed factors, timelapse and
+defect detection; the MCU "valid line" is exactly the line being executed (the real one lags a
+few moves); and the moves' E position is not restored.
+
 ## Seams in production code
 
 **None.** `device.py`, `manager.py` and `transport.py` are driven from outside by replacing

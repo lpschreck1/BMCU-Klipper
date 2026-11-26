@@ -103,3 +103,34 @@ Outcomes: `no_effect` (finished without pausing), `resumed` (paused, fix + Resum
 | load 50 mm | helper exit, repaired after 30 s | stuck | pause message does not say what to do: 'DEVICE_OFFLINE during feed operation'; stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check |
 
 **5 cases, 0 no effect, 0 resumed, 5 stuck.**
+
+## M9 restarts
+
+Klipper restarts (`klipper`: the BMCU helper and firmware keep running, the user starts the print again, cancelling and starting once more if the first start fails) and power loss (`power`: everything restarts, the user takes the power-loss resume). After the boot the BMCU view must match the world or be UNCERTAIN; at the end no tool change may be skipped or repeated.
+
+Outcomes: `no_effect` (finished without pausing), `resumed` (paused, fix + Resume finished it), `stuck` (no user action finished it), `dirty` (finished, but the shared checks of `sim/checks.py` failed: BMCU and the world disagree, a lock was left, or a head printed dry).
+
+| Point | Fault | Outcome | First pause message / problem |
+|---|---|---|---|
+| idle mid-layer | klipper restart | resumed | cannot replace the active BMCU print plan while printer state is printing |
+| BMCU load 50 mm | klipper restart | resumed | cannot replace the active BMCU print plan while printer state is printing |
+| BMCU load near arrival | klipper restart | resumed | cannot replace the active BMCU print plan while printer state is printing |
+| BMCU unload 50 mm | klipper restart | resumed | cannot replace the active BMCU print plan while printer state is printing |
+| between unload and load | klipper restart | resumed | cannot replace the active BMCU print plan while printer state is printing |
+| stock hand-back, load_feeding | klipper restart | resumed | cannot replace the active BMCU print plan while printer state is printing |
+| BEFORE_ON_USE | klipper restart | resumed | cannot replace the active BMCU print plan while printer state is printing |
+| durable write queued, not landed | klipper restart | resumed | cannot replace the active BMCU print plan while printer state is printing |
+| state file empty at boot | klipper restart | no_effect |  |
+| state file truncated at boot | klipper restart | no_effect |  |
+| idle mid-layer | power restart | stuck | stuck: paused after 3 resumes (u1_head2 route journal disagrees with the live EMPTY snapshot: bmcu0 Channel 1; confirm the physical route before moving filament) |
+| BMCU load 50 mm | power restart | stuck | the print failed outright (error): BMCU print plan is not committed before automatic feed; keep the generated BMCU_PRINT_BEGIN/MAP/COMMIT block above PRINT_START |
+| BMCU load near arrival | power restart | stuck | the print failed outright (error): BMCU print plan is not committed before automatic feed; keep the generated BMCU_PRINT_BEGIN/MAP/COMMIT block above PRINT_START |
+| BMCU unload 50 mm | power restart | stuck | stuck: refused after 3 resumes (resume refused: e2 filament runout); user action refused: BMCU route confirmation failed safely; no further action was applied. Check klippy.log before retrying: route confirmation is unav |
+| between unload and load | power restart | no_effect |  |
+| stock hand-back, load_feeding | power restart | no_effect |  |
+| BEFORE_ON_USE | power restart | stuck | stuck: paused after 3 resumes (automatic feed cannot determine the first physical source for hybrid head 2 from the current print position); user action refused: BMCU route confirmation failed safely; no further action w |
+| durable write queued, not landed | power restart | stuck | stuck: paused after 3 resumes (u1_head2 route journal disagrees with the live EMPTY snapshot: bmcu0 Channel 1; confirm the physical route before moving filament) |
+| state file empty at boot | power restart | no_effect |  |
+| state file truncated at boot | power restart | no_effect |  |
+
+**20 cases, 6 no effect, 8 resumed, 6 stuck.**

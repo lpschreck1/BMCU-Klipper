@@ -41,7 +41,7 @@ class Op(object):
 class FakeFirmware(object):
     """One BMCU. ``send_packet(msg_type, cmd_id, payload)`` delivers to the host."""
 
-    def __init__(self, sim, uid=UID, firmware=(1, 0, 5), channels=None):
+    def __init__(self, sim, uid=UID, firmware=(1, 0, 5), channels=None, routes=None):
         self.sim = sim
         self.world = sim.world
         self.reactor = sim.reactor
@@ -52,7 +52,11 @@ class FakeFirmware(object):
         self.send_packet = None          # set by the helper
         self.session_id = 0x1000
         self.seq = 1
-        self.route_state = [P.ROUTE_EMPTY] * 4
+        # MODEL: route states live in flash (Flash_AMS_state_write), so they survive a power
+        # cycle; motion, the active op and the buffer do not. The encoder counter restarts.
+        self.route_state = list(routes) if routes is not None else [P.ROUTE_EMPTY] * 4
+        self.enc_base = [self.world.sources[self.channel_sources[ch]].encoder_mm
+                         for ch in range(4)] if routes is not None else [0.0] * 4
         self.motion = [P.MOTION_IDLE] * 4
         self.buffer_pct = [FREE_BUFFER_PCT] * 4
         self.now_channel = 0xff
@@ -76,12 +80,18 @@ class FakeFirmware(object):
         self.encoder_ok = 0x0f
         self.reactor.add_stepper(self.step)
 
+    def rebind(self, sim):
+        """The Klipper side restarted: the firmware keeps running on the new reactor."""
+        self.sim = sim
+        self.reactor = sim.reactor
+        self.reactor.add_stepper(self.step)
+
     # -- helpers --------------------------------------------------------------------
     def source(self, ch):
         return self.world.sources[self.channel_sources[ch]]
 
     def meters(self, ch):
-        return self.source(ch).encoder_mm / 1000.0
+        return (self.source(ch).encoder_mm - self.enc_base[ch]) / 1000.0
 
     def present(self, ch):
         return 1 if self.source(ch).present else 0

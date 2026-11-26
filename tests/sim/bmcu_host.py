@@ -84,6 +84,16 @@ class FakeHelper(object):
         self._keepalive = self.reactor.register_timer(
             self._keepalive_event, self.reactor.monotonic() + 1.0)
 
+    def rebind(self, bus):
+        """Klipper restarted but this helper process did not: new bus, new reactor, no
+        clients. (The old reactor's timers and in-flight messages are gone with it.)"""
+        self.bus = bus
+        self.reactor = bus.sim.reactor
+        self.conns = []
+        self.firmware.send_packet = self._packet_to_host
+        self._keepalive = self.reactor.register_timer(
+            self._keepalive_event, self.reactor.monotonic() + 1.0)
+
     # -- connections ------------------------------------------------------------------
     def accept(self):
         if not self.running:
@@ -311,10 +321,15 @@ class FakeTime(object):
 
 
 class FakeWriter(object):
-    """Synchronous replacement for DurableWriteWorker (no thread, no fchmod)."""
+    """Replacement for DurableWriteWorker (no thread, no fchmod).
 
-    def __init__(self, reactor, queue_limit=16):
+    Writes land ``rig.write_lag`` seconds after they are queued (0 = at once). A write that
+    has not landed when the machine dies (power cut, Klipper crash) is lost, like the real
+    worker thread's queue."""
+
+    def __init__(self, reactor, rig, queue_limit=16):
         self.reactor = reactor
+        self.rig = rig
         self.closed = False
         self.queue = _queue.Queue()
         self.stats = {'writes': 0, 'failures': 0, 'timeouts': 0,
@@ -325,10 +340,29 @@ class FakeWriter(object):
             return True
         if isinstance(payload, str):
             payload = payload.encode('utf-8')
+        rig = self.rig
+        if not rig.alive:
+            return False
+        if rig.write_lag <= 0:
+            self._land(path, payload)
+            return True
+        item = (path, payload)
+        rig.pending_writes.append(item)
+        self.reactor.register_callback(
+            lambda now, item=item: self._land_pending(item),
+            self.reactor.monotonic() + rig.write_lag)
+        return True
+
+    def _land_pending(self, item):
+        rig = self.rig
+        if rig.alive and item in rig.pending_writes:
+            rig.pending_writes.remove(item)
+            self._land(*item)
+
+    def _land(self, path, payload):
         with open(path, 'wb') as stream:
             stream.write(payload)
         self.stats['writes'] += 1
-        return True
 
     def sync(self, path, timeout=30.0):
         return True
@@ -397,9 +431,15 @@ class Bus(object):
 class BmcuRig(object):
     """Everything the tests need to reach the BMCU side."""
 
-    def __init__(self, sim, config_values=None, with_device=True):
+    def __init__(self, sim, config_values=None, with_device=True, keep=None, routes=None):
         self.sim = sim
         self.with_device = with_device
+        self.config_values = config_values
+        self.alive = True              # False once the machine this rig belongs to is dead
+        self.write_lag = 0.0           # seconds a queued durable write needs to land
+        self.pending_writes = []       # queued, not yet on disk
+        self.keep = keep               # (firmware, helper) that survive a Klipper restart
+        self.routes = routes           # route states the firmware boots with (power cycle)
         self.socket_dir = '/tmp/bmcu-sim-%d' % id(sim)
         _os.makedirs(self.socket_dir + '/u1-plans', exist_ok=True)
         self.bus = Bus(sim, self.socket_dir)
@@ -425,13 +465,19 @@ class BmcuRig(object):
         clock = FakeTime(sim.reactor)
         self._patch(transport, 'time', clock)
         self._patch(gcode_plan, 'time', clock)
-        self._patch(manager_mod, 'DurableWriteWorker', FakeWriter)
+        self._patch(manager_mod, 'DurableWriteWorker',
+                    lambda reactor, **kwargs: FakeWriter(reactor, self, **kwargs))
         if self.with_device:
             from . import bmcu_fw
             # the helper's socket for one device named bmcu0
             sock_path = '%s/%s.sock' % (self.socket_dir, 'bmcu0')
-            fw = bmcu_fw.FakeFirmware(sim)
-            helper = FakeHelper(bus, 'bmcu0', fw)
+            if self.keep is not None:
+                fw, helper = self.keep
+                fw.rebind(sim)
+                helper.rebind(bus)
+            else:
+                fw = bmcu_fw.FakeFirmware(sim, routes=self.routes)
+                helper = FakeHelper(bus, 'bmcu0', fw)
             bus.helpers[sock_path] = helper
             self.firmware['bmcu0'] = fw
             self.helpers['bmcu0'] = helper
@@ -465,6 +511,6 @@ class BmcuRig(object):
         return self.helpers['bmcu0']
 
 
-def attach(sim, config_values=None, with_device=True):
-    sim.bmcu = BmcuRig(sim, config_values, with_device)
+def attach(sim, config_values=None, with_device=True, keep=None, routes=None):
+    sim.bmcu = BmcuRig(sim, config_values, with_device, keep=keep, routes=routes)
     return sim.bmcu

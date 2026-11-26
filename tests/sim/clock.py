@@ -14,6 +14,11 @@ import greenlet
 import _support
 
 
+class Halted(greenlet.GreenletExit):
+    """Raised in every greenlet of a halted reactor (a power cut or a Klipper crash): the
+    machine it belonged to no longer exists. A GreenletExit, so greenlets just end."""
+
+
 class SimReactor(_support.FakeReactor):
     STEP = 0.05            # largest world integration step, seconds
     NEVER = _support.FakeReactor.NEVER
@@ -32,6 +37,7 @@ class SimReactor(_support.FakeReactor):
         self.fd_ready = None       # fn(fd) -> bool, installed by the BMCU fake
         self.exceptions = []       # unhandled exceptions of timers/callbacks
         self.root = greenlet.getcurrent()
+        self.halted = False        # halt(): this machine is gone, see Sim.restart
 
     # -- Klipper reactor API -------------------------------------------------
     def register_timer(self, callback, waketime=NEVER):
@@ -70,8 +76,15 @@ class SimReactor(_support.FakeReactor):
         self.steppers.append(fn)
 
     # -- pausing ---------------------------------------------------------------
+    def halt(self):
+        """The machine dies now. Every greenlet gets ``Halted`` at its next pause and the
+        root greenlet (the test) is woken at once."""
+        self.halted = True
+
     def pause(self, waketime):
         current = greenlet.getcurrent()
+        if self.halted:
+            raise Halted()
         if current is self._dispatch:
             raise RuntimeError('pause() called from the reactor dispatch greenlet')
         if waketime <= self.now and not self._anything_due():
@@ -81,6 +94,8 @@ class SimReactor(_support.FakeReactor):
         if self._dispatch is None or self._dispatch.dead:
             self._dispatch = greenlet.greenlet(self._loop)
         self._dispatch.switch()
+        if self.halted:
+            raise Halted()
         if self.exceptions and current is self.root:
             raise self.exceptions.pop(0)
         return self.now
@@ -187,6 +202,13 @@ class SimReactor(_support.FakeReactor):
     def _loop(self):
         guard = 0
         while True:
+            if self.halted:
+                for item in list(self._sleepers):
+                    if item[2] is self.root:
+                        self._sleepers.remove(item)
+                        item[2].switch()
+                # the root greenlet unwound (or never paused): nothing else may run
+                return
             if self._run_due():
                 guard += 1
                 if guard > 2000000:

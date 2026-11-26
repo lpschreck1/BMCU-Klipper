@@ -139,8 +139,18 @@ class SweepOutcomesTest(unittest.TestCase):
     expected to fail must finish; the ones in KNOWN_BAD are findings (FINDINGS.md)."""
 
     @staticmethod
-    def finding_for(title, point, fault):
+    def finding_for(title, point, fault, kind='stuck', detail=''):
         """The finding (FINDINGS.md) that explains a bad case, or None if it is new."""
+        if title == 'M9 restarts':
+            if 'cannot replace the active BMCU print plan' in detail:
+                return 'F11'
+            if 'power' in fault:
+                if point in ('BMCU load 50 mm', 'BMCU load near arrival', 'BEFORE_ON_USE'):
+                    return 'F12'
+                if point in ('idle mid-layer', 'BMCU unload 50 mm',
+                             'durable write queued, not landed'):
+                    return 'F8'
+            return None
         if title == 'M8 disconnect sweep':
             if point == 'idle mid-layer' and 'replug' not in fault:
                 return None                       # a glitch with nothing moving is harmless
@@ -156,19 +166,17 @@ class SweepOutcomesTest(unittest.TestCase):
     def test_every_case_is_recoverable_or_a_known_finding(self):
         from sim import sweep
         sections = sweep.cached_sweep()
-        bad = set()
+        unexplained, fixed = set(), set()
         for title, _intro, rows in sections[1:]:
-            for point, fault, kind, _detail in rows:
-                if kind in ('stuck', 'dirty'):
-                    bad.add((title, point, fault))
-        unexplained = set(case for case in bad if self.finding_for(*case) is None)
-        self.assertEqual(unexplained, set(), 'new unrecoverable cases')
-        fixed = set()
-        for title, _intro, rows in sections[1:]:
-            for point, fault, kind, _detail in rows:
-                if (kind not in ('stuck', 'dirty') and
-                        self.finding_for(title, point, fault) is not None):
+            for point, fault, kind, detail in rows:
+                finding = self.finding_for(title, point, fault, kind, detail)
+                bad = (kind in ('stuck', 'dirty') or
+                       'cannot replace the active BMCU print plan' in detail)
+                if bad and finding is None:
+                    unexplained.add((title, point, fault))
+                if not bad and finding is not None:
                     fixed.add((title, point, fault))
+        self.assertEqual(unexplained, set(), 'new unrecoverable cases')
         self.assertEqual(fixed, set(), 'fixed: update finding_for and FINDINGS.md')
 
 

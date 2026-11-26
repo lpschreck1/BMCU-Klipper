@@ -185,6 +185,116 @@ def _helper_cases():
     return cases
 
 
+def run_restart_case(kind, trigger, plan=None, spools=None, hook=None, corrupt=None):
+    """One restart case: ``kind`` ('klipper' or 'power') at ``trigger``; the user then starts
+    the print again (klipper) or taps power-loss resume (power). Returns ``(outcome, detail)``
+    with the same outcomes as ``run_spec``; ``dirty`` also covers BMCU believing something
+    the world disagrees with after the boot, and tool changes skipped or repeated."""
+    sim = Sim.reference_machine()
+    try:
+        sim.boot(15.0)
+        sim.setup_u1()
+        sim.load_spools(spools or SPOOLS2)
+        sim.slice(plan or PLAN2)
+        if hook is not None:
+            hook(sim)
+        sim.restart(kind, at=trigger, corrupt_state=corrupt)
+        sim.start()
+        state = sim.run_until_stopped()
+        if state != 'restarted':
+            return 'no_effect', 'the trigger never fired (print %s)' % state
+        problems = ['after the boot: ' + p for p in checks.view_problems(sim)]
+        restart_index = len(sim.tool_changes)
+        actions = ('clear_fault', 'confirm_routes')
+        if corrupt:
+            sim.reconfigure_bmcu(spools or SPOOLS2)       # the user sets BMCU up again
+        try:
+            sim.user.confirm_routes()                    # the panel asks for it at idle
+        except Exception as exc:
+            problems.append('route confirmation refused: %s' % exc)
+        if kind == 'power':
+            sim.power_loss_restore()
+            outcome = checks.recover(sim, actions, start=False)
+        else:
+            outcome = _start_again(sim, actions)
+        if outcome.state == 'complete':
+            outcome.problems.extend(checks.verify(sim))
+            outcome.problems.extend(checks.tool_change_problems(
+                sim, sim.planned_tool_changes(), restart_index, kind))
+        outcome.problems.extend(problems)
+        outcome.problems.extend('user action refused: %s' % r for r in sim.user_refusals)
+        detail = outcome.first_message
+        if outcome.state != 'complete':
+            return 'stuck', '; '.join(outcome.problems) or detail
+        if outcome.problems:
+            return 'dirty', '; '.join(outcome.problems)
+        return ('resumed' if outcome.resumes or detail else 'no_effect'), detail
+    except Exception as exc:
+        return 'stuck', 'sim error: %r' % (exc,)
+    finally:
+        sim.close()
+
+
+def _start_again(sim, actions):
+    """After a Klipper restart: select the file again and start. If that fails, cancel and
+    start once more (what a user does), then resume as usual."""
+    outcome = None
+    first_failure = ''
+    for attempt in range(2):
+        sim.reload_print()
+        sim.start()
+        outcome = checks.recover(sim, actions, start=False)
+        if outcome.state == 'complete':
+            if attempt:
+                outcome.first_message = first_failure
+            return outcome
+        if outcome.state != 'paused':           # failed outright: cancel, then try again
+            first_failure = first = sim.print_stats.message
+            sim.user.cancel()
+            outcome.first_message = first
+            outcome.problems[:] = [p for p in outcome.problems if 'failed outright' not in p]
+            continue
+        break
+    return outcome
+
+
+def _restart_cases():
+    plan3 = [[0], [4, 6], [3]]
+    spools3 = {0: 'PLA grey', 4: 'PLA red', 6: 'PLA black', 3: 'PLA white'}
+
+    def lag(sim):
+        sim.bmcu.write_lag = 5.0
+    points = [
+        ('idle mid-layer', lambda: F.Idle(300.0), None, None, None, None),
+        ('BMCU load 50 mm', lambda: F.BmcuMoving('bmcu0', 'load', 50), None, None, None, None),
+        ('BMCU load near arrival', lambda: F.BmcuMoving('bmcu0', 'load', 1700), None, None,
+         None, None),
+        ('BMCU unload 50 mm', lambda: F.BmcuMoving('bmcu0', 'unload', 50), None, None, None,
+         None),
+        ('between unload and load', lambda: F.BetweenUnloadAndLoad(2), None, None, None, None),
+        ('stock hand-back, load_feeding', lambda: F.StockFeeding(3, 'load_feeding'), plan3,
+         spools3, None, None),
+        ('BEFORE_ON_USE', lambda: F.BeforeOnUse(2), None, None, None, None),
+        ('durable write queued, not landed', lambda: F.WriteQueued(300.0), None, None, lag,
+         None),
+        ('state file empty at boot', lambda: F.Idle(300.0), None, None, None, 'empty'),
+        ('state file truncated at boot', lambda: F.Idle(300.0), None, None, None, 'truncated'),
+    ]
+    cases = []
+    for kind in ('klipper', 'power'):
+        for point, trig, plan, spools, hook, corrupt in points:
+            cases.append((point, '%s restart' % kind, kind, trig, plan, spools, hook, corrupt))
+    return cases
+
+
+def run_restart_section(cases):
+    rows = []
+    for point, fault, kind, trig, plan, spools, hook, corrupt in cases:
+        outcome, detail = run_restart_case(kind, trig(), plan, spools, hook, corrupt)
+        rows.append((point, fault, outcome, detail))
+    return rows
+
+
 SECTIONS = [
     ('M8 disconnect sweep',
      'A BMCU cable glitch (3 s), an unplug and replug (30 s) and a cable that stays out '
@@ -231,6 +341,14 @@ def run_sweep(full=None):
     sections = [('M6 resume sweep', None, rows)]
     for title, intro, factory in SECTIONS:
         sections.append((title, intro, run_section(factory())))
+    sections.append(('M9 restarts',
+                     'Klipper restarts (`klipper`: the BMCU helper and firmware keep running, '
+                     'the user starts the print again, cancelling and starting once more if '
+                     'the first start fails) and power loss (`power`: everything restarts, '
+                     'the user takes the power-loss resume). After the boot the BMCU view must '
+                     'match the world or be UNCERTAIN; at the end no tool change may be '
+                     'skipped or repeated.',
+                     run_restart_section(_restart_cases())))
     return sections
 
 

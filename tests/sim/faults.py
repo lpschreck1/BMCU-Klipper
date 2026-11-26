@@ -199,6 +199,36 @@ class Prestaging(PhaseTrigger):
         return True
 
 
+class BetweenUnloadAndLoad(PhaseTrigger):
+    """``head`` held a BMCU filament and now holds none (the old one is out of the shared
+    tube, the next one is not in yet): both channels are "out"."""
+
+    def __init__(self, head):
+        self.head = head
+        self.seen = False
+        self.fired = False
+
+    def poll(self, sim):
+        sources = [s for s in sim.world.heads[self.head].sources if s.kind == 'bmcu']
+        if any(s.past(s.gears_p) for s in sources):
+            self.seen = True
+            return False
+        return self.seen and not any(s.in_shared for s in sources)
+
+
+class WriteQueued(PhaseTrigger):
+    """A durable state write has been queued but has not landed yet (needs
+    ``sim.bmcu.write_lag`` > 0): the state file is older than the world."""
+
+    def __init__(self, after=0.0):
+        self.after = float(after)      # world time before it may fire
+        self.fired = False
+
+    def poll(self, sim):
+        return (sim.world.now >= self.after and sim.bmcu is not None and
+                bool(sim.bmcu.pending_writes))
+
+
 class Idle(PhaseTrigger):
     """Mid-print, nothing of BMCU's is moving, ``after`` seconds after the first layer."""
 
@@ -212,8 +242,11 @@ class Idle(PhaseTrigger):
             return False
         if self.start is None:
             self.start = sim.world.now
+        from bmcu_core import protocol as P
         fw = sim.bmcu.fw
-        busy = fw.op is not None or any(m != 0 for m in fw.motion)
+        busy = fw.op is not None or any(m in (
+            P.MOTION_SEND_OUT, P.MOTION_BEFORE_ON_USE, P.MOTION_PULL_BACK,
+            P.MOTION_BEFORE_PULL_BACK) for m in fw.motion)
         return sim.world.now - self.start >= self.after and not busy
 
 
@@ -386,6 +419,24 @@ class BmcuDisconnect(Fault):
 
     def clear(self, sim):
         sim.bmcu.helper.set_link(True)
+
+
+class Restart(Fault):
+    """Klipper restarts (``'klipper'``) or the whole machine loses power (``'power'``)."""
+    name = 'restart'
+
+    def __init__(self, kind, corrupt_state=None):
+        assert kind in ('klipper', 'power'), kind
+        assert corrupt_state in (None, 'empty', 'truncated'), corrupt_state
+        self.kind = kind
+        self.corrupt_state = corrupt_state     # damage bmcu_state.json before the next boot
+
+    def apply(self, sim):
+        sim.corrupt_state = self.corrupt_state
+        sim.request_restart(self.kind)
+
+    def clear(self, sim):
+        return None
 
 
 class HelperExit(Fault):

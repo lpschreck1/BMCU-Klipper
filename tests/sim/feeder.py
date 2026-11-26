@@ -151,8 +151,24 @@ class Feeder(object):
         self.hangs = 0
         self.puts = 0
         self.log = []
+        self._boot_states()
         sim.printer.add_object('filament_feed %s' % module, self)
         sim.gcode.register_mux_command('FEED_AUTO', 'MODULE', module, self.cmd_FEED_AUTO)
+
+    def _boot_states(self):
+        """A feeder that boots with filament already in its port (after a restart).
+        # MODEL: a tip past the head sensor reads as load_finish, a tip inside the tube
+        # as preload_finish; the feeder's own MCU does not forget between Klipper runs."""
+        for ch, source in enumerate(self.sources):
+            if not source.present or source.tip is None:
+                continue
+            if source.past(source.sensor_p):
+                self.channel_state[ch] = 'load_finish'
+                self.config['load_finish'][ch] = True
+            elif source.tip > 0:
+                self.channel_state[ch] = 'preload_finish'
+            else:
+                self.channel_state[ch] = 'wait_insert'
 
     # -- the hooks BMCU calls -------------------------------------------------
     def _hang_neutral(self, channel):

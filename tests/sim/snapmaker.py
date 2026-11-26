@@ -10,6 +10,7 @@ import copy
 
 from . import feeder as F
 from . import klipper as K
+from . import world as W
 
 PHYSICAL_EXTRUDER_NUM = 4
 Coord = collections.namedtuple('Coord', ('x', 'y', 'z', 'e'))
@@ -184,6 +185,25 @@ class PrintTaskConfig(object):
         cfg['filament_sub_type'][head] = subtype
         cfg['filament_exist'][head] = exist
 
+    REPRINT_KEYS = ('extruder_map_table', 'extruders_used', 'end_unload_filament',
+                    'flow_calib_extruders')
+
+    def apply_reprint_info(self):
+        """Power-loss restore: the print's own settings come back from the saved copy."""
+        cfg = self.print_task_config
+        for key in self.REPRINT_KEYS:
+            cfg[key] = copy.deepcopy(cfg['reprint_info'][key])
+
+    def reset_print_info(self):
+        cfg = self.print_task_config
+        n = PHYSICAL_EXTRUDER_NUM
+        defaults = {'extruder_map_table': list(range(n)) + [0] * 28,
+                    'extruders_used': [False] * n, 'end_unload_filament': [False] * n,
+                    'flow_calib_extruders': [True] * n}
+        for key, value in defaults.items():
+            cfg[key] = copy.deepcopy(value)
+            cfg['reprint_info'][key] = copy.deepcopy(value)
+
     def backup_filament_info(self, extruder_index=None):
         cfg = self.print_task_config
         indices = range(PHYSICAL_EXTRUDER_NUM) if extruder_index is None else [extruder_index]
@@ -292,7 +312,10 @@ class GcodeMove(object):
         printing = body and sim.print_stats.state == 'printing' and delta > 0
         while remaining > 1e-9:
             step = min(5.0, remaining)
-            _moved, flow = sim.world.gear_move(extruder.index, sign * step)
+            try:
+                _moved, flow = sim.world.gear_move(extruder.index, sign * step)
+            except W.WorldError:
+                raise K.CommandError('Extrude below minimum temp')
             if printing:
                 extruder.print_commanded += step
                 extruder.print_flow += flow

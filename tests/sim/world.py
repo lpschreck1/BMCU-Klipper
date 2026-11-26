@@ -135,6 +135,7 @@ class World(object):
         self.heaters = {}
         self.now = 0.0
         self.events = []
+        self.frozen = False        # power cut / machine being thrown away: nothing moves
 
     # -- construction --------------------------------------------------------
     def add_head(self, index, shared=DEFAULT_SHARED_MM,
@@ -227,7 +228,7 @@ class World(object):
 
     def _apply(self, source, delta):
         """Move the tip by ``delta`` (signed) under the limits. Returns moved."""
-        if source.tip is None:
+        if source.tip is None or self.frozen:
             return 0.0
         if delta >= 0:
             if source.spool_mm <= 0 and source.present:
@@ -278,6 +279,8 @@ class World(object):
         """
         item = self.heads[head]
         mm = float(mm)
+        if self.frozen:
+            return 0.0, 0.0
         if mm > 0 and not item.heater.can_extrude():
             raise WorldError('extrude below %.0f C' % MIN_EXTRUDE_TEMP)
         candidates = [s for s in item.sources if s.past(s.sensor_p)]

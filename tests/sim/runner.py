@@ -3,6 +3,8 @@
 ``Sim.reference_machine()`` builds 4 heads, stock feeders, head sensors, the fake
 Snapmaker modules and (optionally) the real ``BMCUManager`` wired to a fake BMCU.
 """
+import copy
+import gc
 import os
 import shutil
 import sys
@@ -15,7 +17,7 @@ from . import klipper as K
 from . import snapmaker as S
 from . import virtual_sdcard as V
 from . import world as W
-from .clock import SimReactor
+from .clock import Halted, SimReactor
 
 NOOP_COMMANDS = (
     'PRINT_START', 'DEFECT_DETECTION_START', 'DEFECT_DETECT_NOODLE_FIRST',
@@ -24,7 +26,7 @@ NOOP_COMMANDS = (
     'BED_MESH_CALIBRATE', 'PRINT_END', 'M141', 'M190', 'M140', 'M107', 'M106',
     'SM_PRINT_FLOW_CALIBRATE', 'G29', 'M73', 'SET_VELOCITY_LIMIT', 'M201', 'M203',
     'M205', 'M204', 'M220', 'M221', 'EXCLUDE_OBJECT_DEFINE', 'M117', 'M486',
-    'SET_PRINT_STATS_INFO', 'SET_FAN_SPEED', 'FILAMENT_DT_CLEAR', 'M84')
+    'SET_PRINT_STATS_INFO', 'SET_FAN_SPEED', 'FILAMENT_DT_CLEAR', 'M84', 'MOVE_EXTRUDE')
 
 
 def _sync_write_file(reactor, path, data, safe_write=True, timeout=10.0):
@@ -49,11 +51,34 @@ class Stub(object):
 class Sim(object):
     def __init__(self, bmcu=True, state_dir=None):
         # bmcu: True = real manager + fake BMCU, 'manager' = manager with no BMCU, False = stock only
+        self.bmcu_mode = bmcu
         self.reactor = SimReactor()
         self.world = W.World()
-        self.reactor.add_stepper(self.world.step)
         self.tmp = state_dir or tempfile.mkdtemp(prefix='bmcu-sim-')
         self._own_tmp = state_dir is None
+        self.persist = {}             # what survives a restart besides the world and state_dir
+        self.retired_dry = {}         # dry extrusion of machines thrown away by restart()
+        self.pending_faults = []      # (trigger, fault)
+        self.watchers = []
+        self.active_faults = []
+        self.fired = []               # (virtual time, fault name, trigger) log
+        self.restarts = []            # (kind, virtual time)
+        self.user_refusals = []       # what the printer refused the user's actions with
+        self.tool_changes = []        # every BMCU_TOOL_CHANGE dispatched, across restarts
+        self.corrupt_state = None     # 'empty' | 'truncated': damage bmcu_state.json at boot
+        self.restart_kind = None
+        self.bmcu = None
+        self.manager = None
+        self.booted = False
+        self._build_world()
+        self._build_machine()
+        if bmcu:
+            from . import bmcu_host
+            bmcu_host.attach(self, with_device=(bmcu is True))
+
+    def _build_machine(self):
+        """Klipper and the Snapmaker modules over the (persistent) world."""
+        self.reactor.add_stepper(self.world.step)
         self.printer = K.FakePrinter(self.reactor, self.tmp)
         self.gcode = self.printer.gcode
         self.print_stats = S.PrintStats(self)
@@ -61,22 +86,10 @@ class Sim(object):
         self.heaters = {}
         self.extruders = []
         self.sensors = {}
-        self._build_world()
         self._build_printer()
         self.reactor.add_stepper(self._poll_sensors)
         self.reactor.add_stepper(self._poll_phases)
-        self.bmcu = None
-        self.manager = None
-        self.booted = False
-        self.retired_dry = {}         # dry extrusion of machines thrown away by restart()
-        self.pending_faults = []      # (trigger, fault)
-        self.watchers = []
-        self.active_faults = []
-        self.fired = []               # (virtual time, fault name, trigger) log
         self.gcode.on_dispatch = self._on_dispatch
-        if bmcu:
-            from . import bmcu_host
-            bmcu_host.attach(self, with_device=(bmcu is True))
 
     # -- construction --------------------------------------------------------
     @classmethod
@@ -209,6 +222,26 @@ class Sim(object):
                 self.print_task_config.set_head(tool, ftype=material)
         self.settle(70.0)
 
+    def reconfigure_bmcu(self, spools):
+        """What the user redoes when BMCU lost its settings (preset, routes, spool info);
+        the filament itself stays where it is, except that the router will not change a
+        channel that is not EMPTY, so the user first pulls every BMCU filament out and
+        confirms the channel empty."""
+        for channel in range(4):
+            source = self.world.sources['bmcu%d' % channel]
+            if source.tip is not None and source.tip > 0:
+                self.world.pull(source, source.tip)
+            if source.present:        # the spool is still on the channel: PARKED
+                self.run_gcode('BMCU_ROUTE_CONFIRM DEVICE=bmcu0 CHANNEL=%d STATE=PARKED'
+                               % channel)
+        self.setup_u1()
+        for tool, text in sorted(spools.items()):
+            if tool >= 4:
+                material, _, color = text.partition(' ')
+                self.run_gcode('BMCU_SET_FILAMENT DEVICE=bmcu0 CHANNEL=%d MATERIAL=%s COLOR=%s'
+                               % (tool - 4, material, self.COLORS.get(color, 'FFFFFF')))
+        self.settle(5.0)
+
     def insert_bmcu(self, channel, **kwargs):
         """The user puts a spool on a BMCU channel."""
         self.world.insert('bmcu%d' % channel, **kwargs)
@@ -235,6 +268,7 @@ class Sim(object):
                 cfg['extruders_used'][tool] = True
                 cfg['reprint_info']['extruders_used'][tool] = True
         self.gcode_text = text
+        self.print_tools = tools
         return path
 
     def slice_stock(self, plan, **kwargs):
@@ -256,13 +290,18 @@ class Sim(object):
         self.run_gcode('SDCARD_PRINT_FILE')
 
     def run_until_stopped(self, limit=7200.0):
-        """Advance until the print completes, pauses or fails. Returns the state."""
-        end = self.reactor.monotonic() + limit
-        while self.reactor.monotonic() < end:
-            self.reactor.pause(self.reactor.monotonic() + 1.0)
-            if not self.sdcard.is_active() and self.print_stats.state != 'printing':
-                break
-        return self.print_stats.state
+        """Advance until the print completes, pauses or fails. Returns the state, or
+        ``'restarted'`` if the machine was restarted on the way (see ``restart``)."""
+        try:
+            end = self.reactor.monotonic() + limit
+            while self.reactor.monotonic() < end:
+                self.reactor.pause(self.reactor.monotonic() + 1.0)
+                if not self.sdcard.is_active() and self.print_stats.state != 'printing':
+                    break
+            return self.print_stats.state
+        except Halted:
+            self._do_restart()
+            return 'restarted'
 
     def run_print(self):
         self.start_print()
@@ -296,6 +335,10 @@ class Sim(object):
         self.fired.append((round(self.world.now, 1), fault.name, where))
 
     def _on_dispatch(self, command, commandline):
+        if command == 'BMCU_TOOL_CHANGE':
+            for word in commandline.upper().split():
+                if word.startswith('TOOL='):
+                    self.tool_changes.append(int(word[5:]))
         for prefix, callback in list(self.watchers):
             if commandline.upper().startswith(prefix):
                 callback(self, commandline)
@@ -324,16 +367,153 @@ class Sim(object):
         return User(self)
 
     def run_gcode(self, script):
-        self.gcode.run_script_from_command(script)
+        try:
+            self.gcode.run_script_from_command(script)
+        except Halted:
+            self._do_restart()
 
     def settle(self, seconds=5.0):
-        self.reactor.pause(self.reactor.monotonic() + seconds)
+        try:
+            self.reactor.pause(self.reactor.monotonic() + seconds)
+        except Halted:
+            self._do_restart()
 
     def boot(self, seconds=20.0):
         """klippy:ready, then let the BMCU connect and reconcile."""
         self.printer.send_event('klippy:ready')
         self.booted = True
         self.settle(seconds)
+
+    # -- restarts ---------------------------------------------------------------------------
+    def restart(self, kind, at=None, corrupt_state=None):
+        """Restart the machine, over the same world and state directory.
+
+        ``'klipper'``: Klipper crashes or is restarted; the BMCU helper and firmware keep
+        running, queued durable writes are lost, heaters are off. ``'power'``: everything
+        loses power at that instant; motion stops where it was, heaters cool, the BMCU
+        firmware and helper restart (route states survive in flash), and the Snapmaker
+        offers a power-loss resume. With ``at`` (a trigger) it happens when the trigger
+        fires and ``run_until_stopped`` returns ``'restarted'``; without it, now."""
+        assert kind in ('klipper', 'power'), kind
+        if at is not None:
+            from . import faults as F
+            self.inject(at, F.Restart(kind, corrupt_state))
+            return
+        self.corrupt_state = corrupt_state
+        self.request_restart(kind)
+        self._do_restart()
+
+    def request_restart(self, kind):
+        """The machine dies *now* (called from a trigger, anywhere in the simulation)."""
+        self.restart_kind = kind
+        if self.bmcu is not None:
+            self.bmcu.alive = False
+            self.bmcu.pending_writes[:] = []
+        if kind == 'power':
+            self.world.frozen = True
+        self.reactor.halt()
+
+    DOWNTIME = {'klipper': 20.0, 'power': 90.0}
+
+    def _do_restart(self):
+        kind = self.restart_kind or 'klipper'
+        self.restart_kind = None
+        old, rig, world = self.reactor, self.bmcu, self.world
+        self.restarts.append((kind, round(world.now, 1)))
+        for index, extruder in enumerate(self.extruders):
+            self.retired_dry[index] = (self.retired_dry.get(index, 0.0) +
+                                       extruder.print_commanded - extruder.print_flow)
+        self.persist['print_task'] = copy.deepcopy(self.print_task_config.print_task_config)
+        keep = routes = values = None
+        with_device = False
+        if rig is not None:
+            rig.alive = False
+            rig.pending_writes[:] = []
+            with_device, values = rig.with_device, rig.config_values
+            if with_device and kind == 'klipper':
+                keep = (rig.fw, rig.helper)
+            elif with_device:
+                routes = list(rig.fw.route_state)
+            rig.stop()
+        # throw the old machine away; its greenlets are killed (not resumed) by the
+        # collector while nothing can move
+        world.frozen = True
+        old.timers[:] = []
+        old._sleepers[:] = []
+        old._callbacks[:] = []
+        old.fd_handlers.clear()
+        old.steppers[:] = []
+        old._dispatch = None
+        self.printer = self.gcode = self.manager = self.bmcu = self.sdcard = None
+        self.extruders = []
+        self.sensors = {}
+        self.feeders = {}
+        self.macros = None
+        old_now = old.now
+        del old, rig
+        gc.collect()
+        world.frozen = False
+        for heater in world.heaters.values():      # Klipper's heater control is gone either way
+            heater.target = 0.0
+        self._damage_state_file()
+        self.reactor = SimReactor(start=old_now)
+        self._build_machine()
+        self._restore_print_task(kind)
+        if self.bmcu_mode:
+            from . import bmcu_host
+            bmcu_host.attach(self, values, with_device, keep=keep, routes=routes)
+        self.reactor.pause(self.reactor.monotonic() + self.DOWNTIME[kind])
+        self.boot(20.0)
+
+    def _damage_state_file(self):
+        path = os.path.join(self.tmp, 'bmcu_state.json')
+        mode, self.corrupt_state = self.corrupt_state, None
+        if mode is None or not os.path.exists(path):
+            return
+        with open(path, 'rb') as stream:
+            data = stream.read()
+        with open(path, 'wb') as stream:
+            if mode == 'truncated':
+                stream.write(data[:len(data) // 2])
+        # 'empty' leaves a zero-length file
+
+    def planned_tool_changes(self):
+        """The BMCU_TOOL_CHANGE sequence of the loaded file."""
+        found = []
+        for line in self.gcode_text.split(chr(10)):
+            if line.upper().startswith('BMCU_TOOL_CHANGE'):
+                for word in line.upper().split():
+                    if word.startswith('TOOL='):
+                        found.append(int(word[5:]))
+        return found
+
+    def _restore_print_task(self, kind):
+        saved = self.persist.get('print_task')
+        if not saved:
+            return
+        cfg = self.print_task_config.print_task_config
+        if kind == 'power':
+            cfg.update(copy.deepcopy(saved))
+        else:
+            for key in self.print_task_config.KEYS:
+                cfg[key] = copy.deepcopy(saved[key])
+        cfg['filament_exist'] = [bool(self.world.sensor_physical(h)) for h in range(4)]
+
+    def reload_print(self):
+        """The user selects the same file again (after a Klipper restart)."""
+        self.sdcard.load(os.path.join(self.tmp, 'print.gcode'), self.gcode_text)
+        cfg = self.print_task_config.print_task_config
+        for tool in self.print_tools:
+            if tool < 4:
+                cfg['extruders_used'][tool] = True
+                cfg['reprint_info']['extruders_used'][tool] = True
+
+    def power_loss_restore(self):
+        """The user taps "resume" on the power-loss prompt."""
+        found, _info = self.sdcard.power_loss_info_check()
+        if not found:
+            raise AssertionError('the printer offers no power-loss resume')
+        self.run_gcode('SDCARD_PRINT_PL_RESTORE')
 
     def close(self):
         if self.bmcu is not None:
@@ -360,8 +540,37 @@ class User(object):
     def resume(self, limit=7200.0):
         """Press Resume. Returns the state the print reaches next."""
         sim = self.sim
+        before = len(sim.restarts)
         sim.run_gcode('RESUME')
+        if len(sim.restarts) != before:
+            return 'restarted'
         return sim.run_until_stopped(limit)
+
+    def confirm_routes(self):
+        """What the BMCU panel asks for when a route is UNCERTAIN: the user looks at the
+        physical path and confirms it (``BMCU_ROUTE_CONFIRM``). Returns the confirmed
+        channels; raises what the printer refuses with (it refuses while a print is
+        active or paused)."""
+        sim = self.sim
+        confirmed = []
+        for device in sim.manager.get_status()['devices']:
+            for channel in device['channels']:
+                if not channel['uncertain']:
+                    continue
+                source = sim.world.sources['bmcu%d' % channel['channel']]
+                if source.past(source.sensor_p):
+                    # filament in the head: the user feeds it down to the nozzle by hand
+                    if not source.past(source.nozzle_p - 2.0):
+                        sim.world._apply(source, source.nozzle_p - 2.0 - source.tip)
+                    state = 'LOADED'
+                elif source.tip is None or source.tip <= 0:
+                    state = 'EMPTY'
+                else:
+                    state = 'PARKED'
+                sim.run_gcode('BMCU_ROUTE_CONFIRM DEVICE=%s CHANNEL=%d STATE=%s' % (
+                    device['name'], channel['channel'], state))
+                confirmed.append((channel['channel'], state))
+        return confirmed
 
     def clear_fault(self):
         """The human fixes what is physically wrong: every active fault is cleared."""

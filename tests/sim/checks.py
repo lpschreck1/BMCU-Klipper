@@ -48,6 +48,11 @@ def _apply_actions(sim, actions):
             sim.user.clear_fault()
         elif action == 'replug':
             sim.user.clear_fault()            # BmcuDisconnect.clear reconnects the cable
+        elif action == 'confirm_routes':
+            try:
+                sim.user.confirm_routes()
+            except Exception as exc:          # the printer refused: the user is stuck there
+                sim.user_refusals.append(str(exc))
         elif callable(action):
             action(sim)
         else:
@@ -68,6 +73,9 @@ def recover(sim, actions=('clear_fault',), start=True, max_resumes=MAX_RESUMES,
         return outcome
     for attempt in range(max_resumes):
         message = sim.print_stats.message or ''
+        if state not in ('paused', 'refused'):
+            outcome.problems.append('the print failed outright (%s): %s' % (state, message))
+            return outcome
         outcome.messages.append(message)
         if not outcome.first_message:
             outcome.first_message = message
@@ -89,11 +97,10 @@ def recover(sim, actions=('clear_fault',), start=True, max_resumes=MAX_RESUMES,
     return outcome
 
 
-def verify(sim, settle=20.0):
-    """Checks 2-4 on a finished print. Returns a list of problems."""
+def view_problems(sim):
+    """BMCU's view of every channel against the world. ``UNCERTAIN`` is allowed (BMCU
+    knows it does not know); a confident wrong answer is not."""
     problems = []
-    sim.settle(settle)                        # let background jobs finish
-    # 2. BMCU's view against the world
     status = sim.manager.get_status()
     for device in status['devices']:
         for channel in device['channels']:
@@ -107,6 +114,36 @@ def verify(sim, settle=20.0):
             if route == P.ROUTE_EMPTY and source.past(source.sensor_p):
                 problems.append('BMCU says channel %d is empty, but its tip is in the head '
                                 '(%r)' % (channel['channel'], source.tip))
+    return problems
+
+
+def tool_change_problems(sim, planned, restart_index=None, kind='power'):
+    """No BMCU tool change skipped or repeated across a restart. ``planned`` is the file's
+    ``BMCU_TOOL_CHANGE`` sequence; ``restart_index`` is how many ran before the restart."""
+    done = list(sim.tool_changes)
+    if restart_index is None:
+        return [] if done == planned else ['tool changes %r, file plans %r' % (done, planned)]
+    before, after = done[:restart_index], done[restart_index:]
+    if kind == 'klipper':
+        return [] if after == planned else [
+            'after the restart the print ran tool changes %r, the file plans %r' %
+            (after, planned)]
+    problems = []
+    if after != planned[len(planned) - len(after):]:
+        problems.append('after the power loss the print ran tool changes %r, which is not '
+                        'the tail of the plan %r' % (after, planned))
+    if len(before) + len(after) < len(planned):
+        problems.append('tool changes skipped: ran %r then %r, plan %r' %
+                        (before, after, planned))
+    return problems
+
+
+def verify(sim, settle=20.0):
+    """Checks 2-4 on a finished print. Returns a list of problems."""
+    problems = []
+    sim.settle(settle)                        # let background jobs finish
+    # 2. BMCU's view against the world
+    problems.extend(view_problems(sim))
     problems.extend(sim.world.consistent())
     # 3. locks (the web page's "locked"); no public status carries them, so read the sets
     manager = sim.manager
