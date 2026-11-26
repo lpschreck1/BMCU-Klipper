@@ -38,3 +38,68 @@ Reference print `T0 | T4 T6 | T3`, each fault injected just before the trigger l
 | layer 3 start | deformed stock T3 | resumed | extruder[3]: state: load_extruding, error: move_extrude! |
 
 **30 cases, 10 no effect, 20 resumed, 0 stuck.**
+
+## M8 disconnect sweep
+
+A BMCU cable glitch (3 s), an unplug and replug (30 s) and a cable that stays out until the user replugs it, injected at BMCU phases (faults.py phase triggers). The user replugs and presses Resume. The plan is `T0 | T4 T6 | T5 | T6 T0`.
+
+Outcomes: `no_effect` (finished without pausing), `resumed` (paused, fix + Resume finished it), `stuck` (no user action finished it), `dirty` (finished, but the shared checks of `sim/checks.py` failed: BMCU and the world disagree, a lock was left, or a head printed dry).
+
+| Point | Fault | Outcome | First pause message / problem |
+|---|---|---|---|
+| idle mid-layer | disconnect 3 s | no_effect |  |
+| idle mid-layer | disconnect 30 s | no_effect |  |
+| idle mid-layer | disconnect until replug | stuck | stuck: paused after 3 resumes (u1_head2 ownership is safety_hold; reconcile it before moving filament) |
+| load 50 mm | disconnect 3 s | stuck | pause message does not say what to do: 'DEVICE_OFFLINE during feed operation'; stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check |
+| load 50 mm | disconnect 30 s | stuck | pause message does not say what to do: 'DEVICE_OFFLINE during feed operation'; stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check |
+| load 50 mm | disconnect until replug | stuck | pause message does not say what to do: 'DEVICE_OFFLINE during feed operation'; stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check |
+| load 500 mm | disconnect 3 s | stuck | pause message does not say what to do: 'DEVICE_OFFLINE during feed operation'; stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check |
+| load 500 mm | disconnect 30 s | stuck | pause message does not say what to do: 'DEVICE_OFFLINE during feed operation'; stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check |
+| load 500 mm | disconnect until replug | stuck | pause message does not say what to do: 'DEVICE_OFFLINE during feed operation'; stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check |
+| unload 50 mm | disconnect 3 s | stuck | stuck: paused after 3 resumes (u1_head2 route journal disagrees with the live EMPTY snapshot: bmcu0 Channel 1; confirm the physical route before moving filament) |
+| unload 50 mm | disconnect 30 s | stuck | stuck: paused after 3 resumes (u1_head2 route journal disagrees with the live EMPTY snapshot: bmcu0 Channel 1; confirm the physical route before moving filament) |
+| unload 50 mm | disconnect until replug | stuck | stuck: paused after 3 resumes (u1_head2 route journal disagrees with the live EMPTY snapshot: bmcu0 Channel 1; confirm the physical route before moving filament) |
+| BEFORE_ON_USE | disconnect 3 s | stuck | stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check it against) |
+| BEFORE_ON_USE | disconnect 30 s | stuck | stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check it against) |
+| BEFORE_ON_USE | disconnect until replug | stuck | stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check it against) |
+| prestaging T5 | disconnect 3 s | stuck | stuck: paused after 3 resumes (u1_head2 has an UNCERTAIN BMCU route: bmcu0 Channel 1) |
+| prestaging T5 | disconnect 30 s | stuck | stuck: paused after 3 resumes (u1_head2 has an UNCERTAIN BMCU route: bmcu0 Channel 1) |
+| prestaging T5 | disconnect until replug | stuck | stuck: paused after 3 resumes (u1_head2 has an UNCERTAIN BMCU route: bmcu0 Channel 1) |
+
+**18 cases, 2 no effect, 0 resumed, 16 stuck.**
+
+## M8 staging faults
+
+Snag, deformed tip and runout injected through BMCU phases, so they hit the load itself and not the tool-change line (the open item of the M6 sweep).
+
+Outcomes: `no_effect` (finished without pausing), `resumed` (paused, fix + Resume finished it), `stuck` (no user action finished it), `dirty` (finished, but the shared checks of `sim/checks.py` failed: BMCU and the world disagree, a lock was left, or a head printed dry).
+
+| Point | Fault | Outcome | First pause message / problem |
+|---|---|---|---|
+| prestaging T5 | snag bmcu1 58 mm | stuck | stuck: refused after 3 resumes (resume refused: e2 filament runout) |
+| prestaging T5 | deformed bmcu1 | dirty | head 2 printed 53.0 mm of plastic it did not have |
+| prestaging T5 | runout bmcu1 | stuck | stuck: refused after 3 resumes (resume refused: e2 filament runout) |
+| load T5 20 mm | snag bmcu1 58 mm | stuck | stuck: refused after 3 resumes (resume refused: e2 filament runout) |
+| load T5 20 mm | deformed bmcu1 | dirty | head 2 printed 53.0 mm of plastic it did not have |
+| load T5 20 mm | runout bmcu1 | stuck | stuck: refused after 3 resumes (resume refused: e2 filament runout) |
+| load T4 20 mm | snag bmcu0 58 mm | resumed | ENDPOINT_NOT_REACHED: buffer_limit after 58.0 mm. Check the path for a snag or kink, and that the tip is cut clean; this Head is shared, so also check that no other source's filament is parked past the splitter (bmcu0 Ch |
+| load T4 20 mm | deformed bmcu0 | resumed | U1_TOOLHEAD_NOT_LOADED: Head 3 saw no convincing downstream start-to-finish coil response during the normal BEFORE_ON_USE path (path_delta=0.0, gentle_required>=400.0) after 2 final read(s). BMCU pressure and Head motion |
+| load T4 20 mm | runout bmcu0 | resumed | ENDPOINT_NOT_REACHED: no_filament after 23.7 mm. Check the path for a snag or kink, and that the tip is cut clean; this Head is shared, so also check that no other source's filament is parked past the splitter (bmcu0 Cha |
+
+**9 cases, 0 no effect, 3 resumed, 4 stuck, 2 finished dirty.**
+
+## M8 helper death
+
+The transport helper process exits mid-print. Its socket vanishes; the supervisor (`bmcu_host_bootstrap.py --repair`) starts a new one when the user (or 30 s later) does.
+
+Outcomes: `no_effect` (finished without pausing), `resumed` (paused, fix + Resume finished it), `stuck` (no user action finished it), `dirty` (finished, but the shared checks of `sim/checks.py` failed: BMCU and the world disagree, a lock was left, or a head printed dry).
+
+| Point | Fault | Outcome | First pause message / problem |
+|---|---|---|---|
+| idle mid-layer | helper exit, repaired by user | stuck | stuck: paused after 3 resumes (u1_head2 ownership is safety_hold; reconcile it before moving filament) |
+| load 50 mm | helper exit, repaired by user | stuck | pause message does not say what to do: 'DEVICE_OFFLINE during feed operation'; stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check |
+| unload 50 mm | helper exit, repaired by user | stuck | stuck: paused after 3 resumes (u1_head2 route journal disagrees with the live EMPTY snapshot: bmcu0 Channel 1; confirm the physical route before moving filament) |
+| BEFORE_ON_USE | helper exit, repaired by user | stuck | pause message does not say what to do: 'transport sidecar hangup (EOF)'; stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check it ag |
+| load 50 mm | helper exit, repaired after 30 s | stuck | pause message does not say what to do: 'DEVICE_OFFLINE during feed operation'; stuck: paused after 3 resumes (Head 3 has filament at its sensor that BMCU has no record of, and none of its BMCU Channels is online to check |
+
+**5 cases, 0 no effect, 0 resumed, 5 stuck.**

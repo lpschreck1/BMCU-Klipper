@@ -45,8 +45,15 @@ assert sim.world.consistent() == []
 ```
 
 Triggers: `GcodeLine(prefix, n)`, `ToolChange(tool, n)`, `PrintStart(head)`, `Resume(k)`,
-`AtTime(t)`. Faults: `Snag`, `Clog`, `DeformedTip`, `Runout`, `SensorLag`, `SensorStuck`,
-`ParkedInShared`, `Unrecorded`, `BmcuDisconnect`, `HelperStuck`, `UserManual`.
+`AtTime(t)`. Phase triggers (fire on world / fake-firmware / fake-feeder state, never on
+manager internals): `BmcuMoving(source, 'load'|'unload', after_mm)`, `StockFeeding(head, phase)`,
+`BeforeOnUse(head)`, `Prestaging(tool)`, `Idle(after)`. Faults: `Snag`, `Clog`, `DeformedTip`, `Runout`, `SensorLag`, `SensorStuck`,
+`ParkedInShared`, `Unrecorded`, `BmcuDisconnect(duration | None)`, `HelperExit`, `HelperStuck`,
+`UserManual`.
+
+`sim/checks.py` is the shared definition of "recoverable" (`assert_recoverable(test, sim,
+actions)`): the print completes (or pauses with an actionable message), BMCU's view matches the
+world, no lock is left, no head printed dry.
 `sim.watch(prefix, fn)` observes the state just before a line. Assert on public effects
 (status, the world, G-code sent, errors), not on private manager state.
 

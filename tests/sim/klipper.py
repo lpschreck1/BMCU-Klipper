@@ -111,6 +111,7 @@ class FakeGcode(object):
         self._mutex = _Mutex()
         self.mux_commands = {}
         self.depth = 0
+        self.running = []             # command lines being executed right now (any greenlet)
 
     def get_mutex(self):
         return self._mutex
@@ -187,10 +188,13 @@ class FakeGcode(object):
         if handler is None:
             raise CommandError('Unknown command:"%s"' % command)
         self.depth += 1
+        token = (command, commandline)
+        self.running.append(token)
         try:
             handler(GCodeCommand(self, command, commandline, params))
         finally:
             self.depth -= 1
+            self.running.remove(token)
 
 
 class FakeConfig(object):

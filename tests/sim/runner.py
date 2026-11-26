@@ -64,9 +64,11 @@ class Sim(object):
         self._build_world()
         self._build_printer()
         self.reactor.add_stepper(self._poll_sensors)
+        self.reactor.add_stepper(self._poll_phases)
         self.bmcu = None
         self.manager = None
         self.booted = False
+        self.retired_dry = {}         # dry extrusion of machines thrown away by restart()
         self.pending_faults = []      # (trigger, fault)
         self.watchers = []
         self.active_faults = []
@@ -139,6 +141,11 @@ class Sim(object):
             'printer': {'max_physical_extruder_num': 4},
             'pause_resume': {'recover_velocity': 50.0},
             'idle_timeout': {'timeout': 600, 'timeout_on_pause': 1800}}
+
+    def dry_mm(self):
+        """Per head: mm of plastic the extruder was asked for that never left the nozzle."""
+        return {i: round(e.print_commanded - e.print_flow, 3) + self.retired_dry.get(i, 0.0)
+                for i, e in enumerate(self.extruders)}
 
     def coil_for(self, head):
         return self.extruders[head].binding_probe.sensor
@@ -274,6 +281,20 @@ class Sim(object):
         """Call ``callback(sim, commandline)`` just before each line starting with ``prefix``."""
         self.watchers.append((prefix.upper(), callback))
 
+    def _poll_phases(self, dt):
+        """Fire faults whose trigger is a machine phase (faults.PhaseTrigger)."""
+        for item in list(self.pending_faults):
+            trigger, fault = item
+            if getattr(trigger, 'state', False) and self.bmcu is not None and                     self.bmcu.with_device and trigger.poll(self):
+                self.pending_faults.remove(item)
+                trigger.fired = True
+                self._fire(trigger, fault, type(trigger).__name__)
+
+    def _fire(self, trigger, fault, where):
+        fault.apply(self)
+        self.active_faults.append(fault)
+        self.fired.append((round(self.world.now, 1), fault.name, where))
+
     def _on_dispatch(self, command, commandline):
         for prefix, callback in list(self.watchers):
             if commandline.upper().startswith(prefix):
@@ -284,9 +305,7 @@ class Sim(object):
                 self.pending_faults.remove(item)
                 if hasattr(trigger, 'fired'):
                     trigger.fired = True
-                fault.apply(self)
-                self.active_faults.append(fault)
-                self.fired.append((round(self.world.now, 1), fault.name, commandline))
+                self._fire(trigger, fault, commandline)
 
     def run_until_pause(self, limit=7200.0):
         """Run until the print pauses, fails or completes; returns a Result."""

@@ -107,6 +107,17 @@ class FakeHelper(object):
             if not conn.closed:
                 self._send_link(conn)
 
+    def exit(self):
+        """The helper process dies: its socket disappears and every client sees EOF."""
+        self.running = False
+        self.drop_clients()
+
+    def restart(self):
+        """The supervisor (bootstrap --repair) starts a fresh helper on the same port."""
+        self.running = True
+        self.stuck = False
+        self.generation += 1
+
     def drop_clients(self):
         for conn in list(self.conns):
             conn.closed = True
@@ -136,6 +147,8 @@ class FakeHelper(object):
             self.reactor.monotonic() + self.LATENCY)
 
     def _packet_to_host(self, msg_type, cmd_id, payload):
+        if not self.link_online or not self.running:
+            return              # the cable is out (or the helper is dead): nothing arrives
         seq = self.seq
         self.seq += 1
         frame = transport.encode_message(transport.OP_PACKET, msg_type, seq, cmd_id,

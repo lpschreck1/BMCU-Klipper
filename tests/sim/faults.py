@@ -70,6 +70,153 @@ class AtTime(Trigger):
         return (not self.fired) and sim.world.now >= self.t
 
 
+# -- phase triggers: fire on simulated machine state, polled every world step -------------
+#
+# They look only at the world, the fake firmware and the fake Snapmaker feeder, never at the
+# BMCU manager's internals. ``poll(sim)`` returns True once, when the phase is reached.
+
+LOAD_OPS = ('feed', 'autoload', 'encoder_test')
+
+
+class PhaseTrigger(Trigger):
+    state = True
+
+    def matches(self, command, commandline, sim):
+        return False
+
+    def poll(self, sim):
+        raise NotImplementedError
+
+
+def _channel_of(sim, device):
+    """``'bmcu2'`` (a source name), ``2`` or ``(0, 2)`` -> the channel number."""
+    if isinstance(device, str):
+        return int(device[len('bmcu'):])
+    if isinstance(device, tuple):
+        return int(device[1])
+    return int(device)
+
+
+def load_activity(fw, ch):
+    """The firmware is pushing channel ``ch`` towards the head."""
+    from bmcu_core import protocol as P
+    if fw.op is not None and fw.op.channel == ch:
+        return fw.op.type != P.OP_CHANNEL_RETRACT
+    return fw.motion[ch] == P.MOTION_SEND_OUT
+
+
+def unload_activity(fw, ch):
+    from bmcu_core import protocol as P
+    if fw.op is not None and fw.op.channel == ch:
+        return fw.op.type == P.OP_CHANNEL_RETRACT
+    return fw.motion[ch] in (P.MOTION_PULL_BACK, P.MOTION_BEFORE_PULL_BACK)
+
+
+class BmcuMoving(PhaseTrigger):
+    """The fake firmware has moved ``device``'s channel ``after_mm`` in ``direction``
+    (``'load'`` or ``'unload'``) since that move started. ``device`` is the source name
+    (``'bmcu0'`` = channel 1)."""
+
+    def __init__(self, device, direction='load', after_mm=0.0):
+        self.channel = _channel_of(None, device)
+        self.direction = direction
+        self.after_mm = float(after_mm)
+        self.base = None
+        self.fired = False
+
+    def poll(self, sim):
+        fw = sim.bmcu.fw
+        ch = self.channel
+        active = (load_activity if self.direction == 'load' else unload_activity)(fw, ch)
+        encoder = fw.source(ch).encoder_mm
+        if not active:
+            self.base = None
+            return False
+        if self.base is None:
+            self.base = encoder
+        moved = (encoder - self.base) if self.direction == 'load' else (self.base - encoder)
+        return moved >= self.after_mm
+
+
+class StockFeeding(PhaseTrigger):
+    """The fake Snapmaker feeder of ``head`` is in ``filament_feed`` channel state ``phase``
+    (``load_feeding``, ``load_extruding``, ``load_flushing``, ``unload_*`` ...). A trailing
+    ``*`` matches a prefix."""
+
+    def __init__(self, head, phase):
+        self.head = head
+        self.phase = phase
+        self.fired = False
+
+    def poll(self, sim):
+        for feeder in sim.feeders.values():
+            if self.head in feeder.filament_ch:
+                state = feeder.channel_state[feeder.filament_ch.index(self.head)]
+                if self.phase.endswith('*'):
+                    return state.startswith(self.phase[:-1])
+                return state == self.phase
+        return False
+
+
+class BeforeOnUse(PhaseTrigger):
+    """Inside BMCU's BEFORE_ON_USE (the toolhead check) on a channel that feeds ``head``."""
+
+    def __init__(self, head):
+        self.head = head
+        self.fired = False
+
+    def poll(self, sim):
+        from bmcu_core import protocol as P
+        fw = sim.bmcu.fw
+        return any(fw.motion[ch] == P.MOTION_BEFORE_ON_USE and
+                   sim.channel_head[ch] == self.head for ch in range(4))
+
+
+class Prestaging(PhaseTrigger):
+    """BMCU is moving filament for ``tool``'s head in the background: the firmware is loading
+    or unloading a channel of that head while the foreground G-code is not the change to
+    ``tool`` itself (nor the print-start feed of that head, nor the print end)."""
+
+    def __init__(self, tool):
+        self.tool = int(tool)
+        self.head = None
+        self.fired = False
+
+    def poll(self, sim):
+        head = sim.channel_head[self.tool - 4]
+        fw = sim.bmcu.fw
+        if not any(load_activity(fw, ch) or unload_activity(fw, ch)
+                   for ch in range(4) if sim.channel_head[ch] == head):
+            return False
+        for command, line in sim.gcode.running:
+            upper = line.upper()
+            if command == 'BMCU_TOOL_CHANGE' and ('TOOL=%d' % self.tool) in upper:
+                return False
+            if command == 'BMCU_AUTO_FEED' and ('EXTRUDER=%d' % head) in upper:
+                return False
+            if command == 'BMCU_PRINT_END':
+                return False
+        return True
+
+
+class Idle(PhaseTrigger):
+    """Mid-print, nothing of BMCU's is moving, ``after`` seconds after the first layer."""
+
+    def __init__(self, after=60.0):
+        self.after = float(after)
+        self.start = None
+        self.fired = False
+
+    def poll(self, sim):
+        if sim.print_stats.state != 'printing':
+            return False
+        if self.start is None:
+            self.start = sim.world.now
+        fw = sim.bmcu.fw
+        busy = fw.op is not None or any(m != 0 for m in fw.motion)
+        return sim.world.now - self.start >= self.after and not busy
+
+
 # -- faults ------------------------------------------------------------------------------
 
 
@@ -228,16 +375,38 @@ class BmcuDisconnect(Fault):
     name = 'bmcu_disconnect'
 
     def __init__(self, duration=5.0):
-        self.duration = duration
+        self.duration = duration          # None: down until the user replugs (clear_fault)
 
     def apply(self, sim):
         sim.bmcu.helper.set_link(False)
-        sim.reactor.register_callback(
-            lambda now: sim.bmcu.helper.set_link(True),
-            sim.reactor.monotonic() + self.duration)
+        if self.duration is not None:
+            sim.reactor.register_callback(
+                lambda now: sim.bmcu.helper.set_link(True),
+                sim.reactor.monotonic() + self.duration)
 
     def clear(self, sim):
         sim.bmcu.helper.set_link(True)
+
+
+class HelperExit(Fault):
+    """The transport helper process dies mid-print. Its socket disappears. The supervisor
+    (``bmcu_host_bootstrap.py --repair`` or the service manager) starts a new one
+    ``restart_after`` seconds later; ``None`` means only ``clear`` (the user) does."""
+    name = 'helper_exit'
+
+    def __init__(self, restart_after=None):
+        self.restart_after = restart_after
+
+    def apply(self, sim):
+        sim.bmcu.helper.exit()
+        if self.restart_after is not None:
+            sim.reactor.register_callback(
+                lambda now: sim.bmcu.helper.restart(),
+                sim.reactor.monotonic() + self.restart_after)
+
+    def clear(self, sim):
+        if not sim.bmcu.helper.running:
+            sim.bmcu.helper.restart()
 
 
 class HelperStuck(Fault):
