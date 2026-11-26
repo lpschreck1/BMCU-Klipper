@@ -258,7 +258,7 @@ class ForegroundSelectedPrestageTest(unittest.TestCase):
     is blocked") with no fault at all."""
 
     def path(self):
-        path = os.path.join(FIXTURES, 'bmcu_test_print.gcode')
+        path = os.path.join(FIXTURES, 'bmcu_mixed_side_by_side.gcode')
         if not os.path.exists(path):
             self.skipTest('tests/sim/fixtures/real/bmcu_test_print.gcode not supplied')
         return path
@@ -282,6 +282,54 @@ class ForegroundSelectedPrestageTest(unittest.TestCase):
             state = sim.run_until_stopped()
         self.assertEqual(state, 'paused')
         self.assertIn('is not PARKED; prestage is blocked', sim.print_stats.message)
+
+
+class TestPrintTest(unittest.TestCase):
+    """The post-install test print, sliced as one stacked tower (six bands: T4 into
+    Head 3, T7 into Head 4, stock T1, stock T0, Head 4 handed back to its stock T3,
+    then T4 swapped for T5 on Head 3), run as its README asks: Pause during band 4,
+    wait 30 s, Resume."""
+
+    def path(self):
+        path = os.path.join(FIXTURES, 'bmcu_test_print.gcode')
+        if not os.path.exists(path):
+            self.skipTest('tests/sim/fixtures/real/bmcu_test_print.gcode not supplied')
+        return path
+
+    def test_it_uses_every_head_the_hand_back_and_the_shared_head_swap(self):
+        sim = run_file(self, self.path())
+        self.assertEqual(sim.planned_tool_changes(), [4, 7, 1, 0, 3, 5])
+
+    def test_pause_in_band_4_then_resume(self):
+        class Band4(F.Trigger):
+            """The 200th move after the change to band 4 (stock T0)."""
+            def __init__(self):
+                self.seen, self.moves = False, 0
+
+            def matches(self, command, commandline, sim):
+                if commandline.upper().startswith('BMCU_TOOL_CHANGE TOOL=0'):
+                    self.seen = True
+                elif self.seen and command == 'G1':
+                    self.moves += 1
+                    return self.moves == 200
+                return False
+
+        class UserPause(F.Fault):
+            name = 'user_pause'
+
+            def apply(self, sim):
+                sim.run_gcode('PAUSE')
+
+            def clear(self, sim):
+                return None
+
+        sim = run_file(self, self.path(), faults=[(Band4(), UserPause())])
+        sim.start()
+        self.assertEqual(sim.run_until_stopped(), 'paused')
+        sim.settle(30.0)
+        self.assertEqual(sim.user.resume(), 'complete', sim.print_stats.message)
+        self.assertEqual(sim.tool_changes, sim.planned_tool_changes())
+        self.assertEqual(checks.verify(sim), [])
 
 
 if __name__ == '__main__':

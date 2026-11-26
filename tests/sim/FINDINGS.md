@@ -24,6 +24,7 @@ the source; **medium** = plausible on a printer but the physical trigger is mode
 - `G21`, `SET_PRESSURE_ADVANCE`, `EXCLUDE_OBJECT_START` and `EXCLUDE_OBJECT_END` are no-ops.
 - `run_until_stopped` and `User.resume` use `Sim.run_limit`, which `slice_file` raises to 150 simulated seconds per tool change (the 874-change Baby Yoda print needs about 36 h).
 - `World.push`: a source's own wheel can't push its tip through the Head's extruder gears; only the gears turning carry it to the nozzle. A background SEND_OUT to a parked Head had pushed the tip to the nozzle, and the next head check started inside the coil zone and paused.
+- Snapmaker's INNER_RESUME purges 20 mm, retracts, then resumes with `EXTRUDE=unretract` (0 by default), so the print refills the nozzle; that retraction earns the same credit.
 - Dry printing: the print's own retractions (`G1 E-0.8` around travels, `E-10` at tool changes) earn up to 12 mm of credit, so the un-retract after them isn't counted as dry printing. A load that stops 34 mm short still shows.
 
 | ID | Status | Scenario | Failure | Suspected cause and location | Confidence | Test |

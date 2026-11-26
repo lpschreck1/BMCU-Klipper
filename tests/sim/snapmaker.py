@@ -312,7 +312,11 @@ class GcodeMove(object):
         remaining = abs(delta)
         sign = 1.0 if delta >= 0 else -1.0
         printing = body and sim.print_stats.state == 'printing' and delta > 0
-        if body and sim.print_stats.state == 'printing' and delta < 0:
+        resume_retract = (not body and delta < 0 and
+                          sim.print_stats.state in ('paused', 'pause'))
+        if resume_retract or (body and sim.print_stats.state == 'printing' and delta < 0):
+            # (also Snapmaker's INNER_RESUME: purge 20 mm, retract, then RESUME_BASE
+            # EXTRUDE=unretract, which is 0 by default: the print refills the nozzle)
             # MODEL: the print's own retraction (G1 E-0.8 before a travel, E-10 at a
             # tool change). The un-retract that follows refills the nozzle rather than
             # printing, so it is not dry printing. Capped, so a load that stopped short
