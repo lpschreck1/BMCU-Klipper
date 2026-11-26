@@ -437,9 +437,60 @@ class WeakPressureAssistTest(unittest.TestCase):
         sim.inject(F.GcodeLine('PRINT_START'), F.Clog(2))
         sim.start()
         self.assertEqual(sim.run_until_stopped(), 'paused')
-        self.assertIn('without success: push bmcu0 Channel', sim.print_stats.message)
+        self.assertIn('without success: check the tip of bmcu0 Channel', sim.print_stats.message)
         out = checks.recover(sim, ('clear_fault',), start=False)
         self.assertEqual(out.state, 'complete', out.messages)
+
+
+class TrimThenResumeTest(unittest.TestCase):
+    """2026-11-26 on the printer: after the load failed, the user trimmed the tip and
+    pressed Resume, and BMCU did not feed it again: the recovery only checked the
+    coil. It now loads the Channel again (pulled back out of the Head: EMPTY), or
+    pushes it into the gears (still at the Head sensor: UNCERTAIN)."""
+
+    def paused_then_trimmed(self, leave_at_mm):
+        sim = make_sim(self, plan=[[0], [4], [5], [3]],
+                       spools={0: 'PLA grey', 4: 'PLA red', 5: 'PLA blue', 3: 'PLA white'})
+        sim.inject(F.GcodeLine('PRINT_START'), F.DeformedTip('bmcu1'))
+        sim.start()
+        self.assertEqual(sim.run_until_stopped(), 'paused')
+        self.assertIn('U1_TOOLHEAD_NOT_LOADED', sim.print_stats.message)
+        # the user pulls it back, trims the tip and puts it back to ``leave_at_mm``
+        # past the Head sensor (negative: behind it)
+        source = sim.world.sources['bmcu1']
+        source.quality = 'good'
+        sim.world.pull(source, source.tip - (source.sensor_p + leave_at_mm))
+        sim.settle(2.0)
+        return sim
+
+    def assert_finished(self, sim, state):
+        self.assertEqual(state, 'complete', sim.print_stats.message)
+        changes = [t for i, t in enumerate(sim.tool_changes)
+                   if i == 0 or sim.tool_changes[i - 1] != t]   # a retried load twice
+        self.assertEqual(changes, sim.planned_tool_changes())
+        self.assertEqual(sim.world.consistent(), [])
+
+    def test_pulled_back_behind_the_sensor_it_is_loaded_again(self):
+        sim = self.paused_then_trimmed(-40.0)
+        self.assert_finished(sim, sim.user.resume())
+
+    def test_without_reloading_an_empty_route_resume_fails(self):
+        sim = self.paused_then_trimmed(-40.0)
+        with mock.patch.object(M.BMCUManager, 'U1_RECOVERY_RELOAD_EMPTY', False):
+            with self.assertRaises(CommandError):
+                sim.user.resume()
+
+    def test_left_at_the_sensor_it_is_pushed_into_the_gears(self):
+        sim = self.paused_then_trimmed(8.0)
+        self.assert_finished(sim, sim.user.resume())
+
+    def test_without_feeding_again_resume_fails(self):
+        sim = self.paused_then_trimmed(8.0)
+        def no_feed(self, *args, **kwargs):
+            raise E.EndpointError('U1_TOOLHEAD_NOT_LOADED: not fed again')
+        with mock.patch.object(M.BMCUManager, '_u1_recovery_feed_again', no_feed):
+            with self.assertRaises(CommandError):
+                sim.user.resume()
 
 
 class BufferSlackIdentifyTest(unittest.TestCase):

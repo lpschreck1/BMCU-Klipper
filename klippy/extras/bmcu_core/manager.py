@@ -1904,6 +1904,14 @@ class BMCUManager(object):
         if (endpoint is None or
                 not self._assigned_routes_for_endpoint(endpoint.name)):
             return False
+        pending = self._u1_toolchange_resume_pending
+        if (isinstance(pending, dict) and pending.get('kind') == 'before_on_use' and
+                pending.get('endpoint') == endpoint.name and
+                endpoint.entry_sensor_snapshot().get('physical_detected')):
+            # The failed load's own recovery runs in the resume (T/SM_PRINT_AUTO_FEED)
+            # and pushes the filament into the gears; identifying it by extruding
+            # cannot work while its tip is short of the gears.
+            return False
         try:
             # A failed load can leave its route UNCERTAIN; settle it first.
             self._settle_u1_routes_after_reconnect(endpoint, gcmd)
@@ -2184,9 +2192,94 @@ class BMCUManager(object):
             self._critical_motion_depth)
 
     U1_COIL_ASSIST_MM = 25.0          # BMCU push past its pressure target
-    U1_COIL_ASSIST_CONTACT_PCT = 95   # stop once the buffer is this compressed
+    U1_COIL_ASSIST_CONTACT_PCT = 92   # stop once the buffer is this compressed
     U1_COIL_ASSIST_HEAD_MM = 25.0     # Head extruder turns meanwhile, to grip
     U1_COIL_ASSIST_HEAD_SPEED = 180.0  # mm/min
+
+    def _u1_push_into_turning_gears(self, device, channel, endpoint):
+        """Load the buffer spring against the gears, then turn the gears.
+
+        BMCU may not talk to the BMCU while the Head moves (printer-critical
+        motion), so the push cannot run while the gears turn. Instead BMCU feeds
+        until the buffer is compressed to U1_COIL_ASSIST_CONTACT_PCT (as the user
+        did by pressing the buffer in, 2026-11-26), which leaves the spring pushing
+        the tip, and only then turns the Head extruder slowly so the gears take it.
+        Returns the mm BMCU fed."""
+        device.set_motion(channel, protocol.MOTION_IDLE)
+        device.refresh()
+        before = float(device.status['meters'][channel])
+        op_id = device.start_feed_distance(
+            channel, self.U1_COIL_ASSIST_MM, self.U1_COIL_ASSIST_CONTACT_PCT, 10000)
+        result = self._wait_feed_operation(device, op_id, 12.0, endpoint)
+        device.refresh()
+        pushed = (float(device.status['meters'][channel]) - before) * 1000.0
+        logging.info(
+            'BMCU %s Channel %d fed %.1f mm until the buffer read %s%% (%s); '
+            'turning the %s extruder %.0f mm',
+            device.name, channel + 1, pushed, device.status['buffer_pct'][channel],
+            (result or {}).get('reason', 'done'), endpoint.name,
+            self.U1_COIL_ASSIST_HEAD_MM)
+        endpoint.extrude(self.U1_COIL_ASSIST_HEAD_MM, self.U1_COIL_ASSIST_HEAD_SPEED)
+        return pushed
+
+    def _u1_drive_to_coil(self, device, channel, endpoint, material, baseline,
+                          threshold, remaining_mm=None):
+        """Head-first push into the gears, then the normal BEFORE_ON_USE run to the
+        coil with the pressure hold, then the coil check against ``baseline``."""
+        pushed = self._u1_push_into_turning_gears(device, channel, endpoint)
+        device.set_motion(channel, protocol.MOTION_BEFORE_ON_USE)
+        remaining = float(remaining_mm or 34.0)
+        endpoint.extrude(max(5.0, min(remaining, 70.0)), 360.0)
+        evidence = endpoint.verify_loaded_after_pause(
+            material, baseline=baseline, threshold=threshold)
+        evidence = dict(evidence or {})
+        evidence['assist_push_mm'] = pushed
+        return evidence
+
+    U1_RECOVERY_RELOAD_EMPTY = True
+
+    def _u1_recovery_feed_again(self, device, channel, endpoint, material, pending,
+                                temperature_profile=None):
+        """On Resume after a failed BEFORE_ON_USE: the filament is not in the gears
+        (trimmed, pulled back, or never got there). Heat and move to the discard
+        position, bring it to the Head sensor if it is behind it, then push it into
+        the turning gears and run it to the coil, as a load would."""
+        self._endpoint_temperature_call(
+            endpoint, 'prepare_load', material, temperature_profile)
+        self._endpoint_temperature_call(
+            endpoint, 'prepare_load_position', material, temperature_profile)
+        self._endpoint_temperature_call(
+            endpoint, 'ensure_bite_ready', material, temperature_profile)
+        snapshot = endpoint.entry_sensor_snapshot()
+        if not snapshot.get('physical_detected'):
+            maximum_mm = float(endpoint.get('max_route_mm', self.max_route_mm) or
+                               self.max_route_mm)
+            contact_pct = self._device_loading_handoff_pct(device, endpoint)
+            timeout_s = self._effective_feed_timeout(
+                device, maximum_mm, float(endpoint.get(
+                    'contact_timeout', self.contact_timeout) or
+                    self.contact_timeout))
+            logging.info('BMCU recovery: feeding %s Channel %d to the %s sensor',
+                         device.name, channel + 1, endpoint.name)
+            device.set_motion(channel, protocol.MOTION_IDLE)
+            op_id, policy = self._start_endpoint_arrival_operation(
+                device, channel, endpoint, maximum_mm, contact_pct, timeout_s)
+            if policy.get('sensor_authoritative'):
+                arrival = self._wait_sensor_arrival(
+                    device, channel, endpoint, op_id, policy, maximum_mm,
+                    poll_interval=0.050)
+            else:
+                arrival = self._wait_feed_operation(
+                    device, op_id, timeout_s + 2.0, endpoint, 'entry_sensor')
+            self._resolve_endpoint_arrival_result(
+                device, channel, endpoint, arrival, policy, timeout_s,
+                allow_partial=False)
+        logging.info('BMCU recovery: pushing %s Channel %d into the turning %s gears',
+                     device.name, channel + 1, endpoint.name)
+        return self._u1_drive_to_coil(
+            device, channel, endpoint, material,
+            pending.get('coil_baseline'), pending.get('coil_threshold'),
+            70.0 - self.U1_COIL_ASSIST_HEAD_MM)
 
     def _u1_coil_assist_push(self, device, channel, endpoint, material, exc):
         """One automatic retry when the BEFORE_ON_USE coil check sees nothing.
@@ -2194,9 +2287,8 @@ class BMCUManager(object):
         2026-11-26 on the printer: bmcu0 Channel 2 stopped just short of Head 3's
         gears three times. The firmware's pressure hold squeezed the buffer to its
         target (81 of 82 %) and stopped pushing; the filament didn't move until the
-        user pushed by hand. Here BMCU makes one measured push past that target
-        (FEED_DISTANCE, stopping at 95 % buffer) while the Head extruder turns
-        slowly, then the coil is checked again. If that fails too, the original
+        user pushed by hand. BMCU now makes one measured push past that target into
+        the turning gears (_u1_drive_to_coil). If that fails too, the original
         error stands and the print pauses as before."""
         if (getattr(endpoint, 'driver', '') != 'snapmaker_u1' or
                 'U1_TOOLHEAD_NOT_LOADED' not in str(exc)):
@@ -2207,27 +2299,13 @@ class BMCUManager(object):
         if baseline is None or threshold is None:
             raise exc
         logging.info(
-            'BMCU %s Channel %d did not reach the %s gears; pushing %.0f mm past '
-            'the pressure target while the Head turns, then checking again',
+            'BMCU %s Channel %d did not reach the %s gears; turning the Head and '
+            'pushing %.0f mm past the pressure target, then checking again',
             device.name, channel + 1, endpoint.name, self.U1_COIL_ASSIST_MM)
         try:
-            device.set_motion(channel, protocol.MOTION_IDLE)
-            before = float(device.status['meters'][channel])
-            op_id = device.start_feed_distance(
-                channel, self.U1_COIL_ASSIST_MM, self.U1_COIL_ASSIST_CONTACT_PCT,
-                int((self.U1_COIL_ASSIST_HEAD_MM /
-                     self.U1_COIL_ASSIST_HEAD_SPEED) * 60000.0) + 10000)
-            endpoint.extrude(self.U1_COIL_ASSIST_HEAD_MM,
-                             self.U1_COIL_ASSIST_HEAD_SPEED)
-            result = self._wait_feed_operation(device, op_id, 15.0, endpoint)
-            device.refresh()
-            pushed = (float(device.status['meters'][channel]) - before) * 1000.0
-            # then the normal BEFORE_ON_USE run to the coil, with the pressure hold
-            device.set_motion(channel, protocol.MOTION_BEFORE_ON_USE)
-            remaining = float(config.get('_u1_last_nozzle_search_mm') or 34.0)
-            endpoint.extrude(max(5.0, min(remaining, 70.0)), 360.0)
-            evidence = endpoint.verify_loaded_after_pause(
-                material, baseline=baseline, threshold=threshold)
+            evidence = self._u1_drive_to_coil(
+                device, channel, endpoint, material, baseline, threshold,
+                config.get('_u1_last_nozzle_search_mm'))
         except Exception as assist_exc:
             logging.info('BMCU %s Channel %d assist push did not load it: %s',
                          device.name, channel + 1, assist_exc)
@@ -2236,16 +2314,14 @@ class BMCUManager(object):
             except Exception:
                 pass
             raise EndpointError(
-                '%s BMCU also pushed %.0f mm past its pressure target, without '
-                'success: push %s Channel %d down by hand until the Head grips it, '
-                'then Resume' % (str(exc), self.U1_COIL_ASSIST_MM, device.name,
-                                 channel + 1))
+                '%s BMCU also pushed up to %.0f mm past its pressure target and '
+                'turned the gears, without success: check the tip of %s Channel %d '
+                '(trim it if bent) and that the nozzle is clear, then Resume, and '
+                'BMCU will feed it again' % (
+                    str(exc), self.U1_COIL_ASSIST_MM, device.name, channel + 1))
         logging.info(
-            'BMCU %s Channel %d loaded after the assist push (%.1f mm, %s)',
-            device.name, channel + 1, pushed,
-            (result or {}).get('reason', 'done'))
-        evidence = dict(evidence or {})
-        evidence['assist_push_mm'] = pushed
+            'BMCU %s Channel %d loaded after the assist push (%.1f mm)',
+            device.name, channel + 1, evidence.get('assist_push_mm', 0.0))
         return evidence
 
     def _wait_critical_motion_released(self, timeout=None):
@@ -16337,6 +16413,30 @@ class BMCUManager(object):
         recovery_phase = str(pending.get('phase', 'verify') or 'verify')
         if recovery_phase not in ('verify', 'primed', 'loaded'):
             raise BMCUError('invalid U1 toolchange recovery phase')
+        device.refresh()
+        if (self.U1_RECOVERY_RELOAD_EMPTY and recovery_phase == 'verify' and
+                self._route_states_from_status(device.status)[channel] ==
+                protocol.ROUTE_EMPTY):
+            # The filament was pulled back out of the Head (the user trimmed it, or
+            # Resume settled the route with the Head sensor clear): load it again
+            # from scratch, as a tool change would.
+            logging.info(
+                'BMCU recovery: %s Channel %d is EMPTY; loading T%d again',
+                device.name, channel + 1, int(tool))
+            self._u1_toolchange_resume_pending.clear()
+            previous_profile = getattr(self, '_u1_pending_temperature_profile', None)
+            try:
+                self._u1_pending_temperature_profile = temperature_profile
+                self.load_tool(int(tool), gcmd)
+            finally:
+                self._u1_pending_temperature_profile = previous_profile
+            self._activate_u1_logical_tool(int(tool), endpoint)
+            if plan_index is not None and int(plan_index) >= 0:
+                self._commit_u1_toolchange(plan_index)
+            self._save_runtime()
+            if gcmd is not None:
+                gcmd.respond_info('BMCU loaded T%d again and resumed' % int(tool))
+            return True
         self._lock(
             device, endpoint, 'RESUME BEFORE_ON_USE T%d' % int(tool),
             channel=channel)
@@ -16379,10 +16479,17 @@ class BMCUManager(object):
 
             if recovery_phase == 'verify':
                 self._set_phase(device, 'RESUME_BEFORE_ON_USE_VERIFY', channel=channel)
-                endpoint.verify_loaded_after_pause(
-                    material=material,
-                    baseline=pending.get('coil_baseline'),
-                    threshold=pending.get('coil_threshold'))
+                try:
+                    endpoint.verify_loaded_after_pause(
+                        material=material,
+                        baseline=pending.get('coil_baseline'),
+                        threshold=pending.get('coil_threshold'))
+                except EndpointError:
+                    # 2026-11-26: the user trimmed the tip and pressed Resume, and
+                    # nothing fed it. Feed it again instead of refusing.
+                    self._u1_recovery_feed_again(
+                        device, channel, endpoint, material, pending,
+                        temperature_profile)
                 endpoint.suspend_managed_sensors()
                 self._endpoint_temperature_call(
                     endpoint, 'prepare_load', material, temperature_profile,
