@@ -37,6 +37,8 @@ _GCODE_REQUIRED = object()
 PRINT_PLAN_SCHEMA = 1
 U1_NATIVE_TOOL_COUNT = 4
 U1_LOGICAL_TOOL_LIMIT = 32
+# How long print start waits for a planner that is still scanning a large file.
+U1_PLANNER_BUSY_LIMIT_S = 600.0
 GENERIC_EXTERNAL_TOOL = 0
 GENERIC_BMCU_TOOL_MIN = 1
 GENERIC_LOGICAL_TOOL_LIMIT = 256
@@ -9525,6 +9527,27 @@ class BMCUManager(object):
         except (KeyError, TypeError, ValueError, OverflowError):
             return False
 
+    def _u1_planner_busy(self, request_id):
+        """True while the planner process that took this request is alive and
+        still scanning it."""
+        busy_path = os.path.join(self._u1_planner_result_dir, request_id + '.busy')
+        try:
+            with open(busy_path, 'r') as stream:
+                pid = int(stream.read(32).strip())
+        except (OSError, ValueError):
+            return False
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
     def _read_u1_planner_result(self, path, request_id):
         flags = os.O_RDONLY
         if hasattr(os, 'O_CLOEXEC'):
@@ -9694,6 +9717,7 @@ class BMCUManager(object):
         }, sort_keys=True, separators=(',', ':')).encode('utf-8')
         self._u1_planner_requests += 1
         started = self.reactor.monotonic()
+        busy_logged = False
         try:
             client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             try:
@@ -9729,6 +9753,20 @@ class BMCUManager(object):
                                     raise
                                 now = self.reactor.monotonic()
                                 if now >= deadline:
+                                    if (now - started < U1_PLANNER_BUSY_LIMIT_S and
+                                            self._u1_planner_busy(request_id)):
+                                        # Still scanning a large file, not hung.
+                                        if not busy_logged:
+                                            busy_logged = True
+                                            logging.info(
+                                                'BMCU U1 source planner is still '
+                                                'scanning %s after %.1f s; waiting',
+                                                os.path.basename(path),
+                                                now - started)
+                                        deadline = min(
+                                            now + float(self.u1_planner_timeout),
+                                            started + U1_PLANNER_BUSY_LIMIT_S)
+                                        continue
                                     break
                                 self.reactor.pause(min(
                                     deadline, now + self.u1_planner_poll_interval))

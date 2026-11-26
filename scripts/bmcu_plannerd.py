@@ -65,6 +65,26 @@ def _atomic_result(directory, request_id, payload):
         if os.path.exists(temporary):
             os.unlink(temporary)
 
+def _mark_busy(directory, request_id):
+    """Tell Klipper this request is being scanned, so a large file is
+    waited for instead of being treated as a hung planner."""
+    target = os.path.join(directory, request_id + '.busy')
+    fd, temporary = tempfile.mkstemp(prefix='.' + request_id + '.', dir=directory)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write('%d\n' % os.getpid())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+def _clear_busy(directory, request_id):
+    try:
+        os.unlink(os.path.join(directory, request_id + '.busy'))
+    except OSError:
+        pass
+
 def _cleanup_results(directory, max_age=300.0):
     cutoff = time.time() - float(max_age)
     try:
@@ -72,7 +92,7 @@ def _cleanup_results(directory, max_age=300.0):
     except OSError:
         return
     for name in names:
-        if not re.match(r'^[0-9a-f]{32}\.json$', name):
+        if not re.match(r'^[0-9a-f]{32}\.(?:json|busy)$', name):
             continue
         path = os.path.join(directory, name)
         try:
@@ -156,9 +176,15 @@ def main():
                 except InterruptedError:
                     continue
                 request_id = ''
+                path = ''
                 started = time.monotonic()
                 try:
                     request_id, path, expected = _parse_request(raw)
+                    try:
+                        _mark_busy(result_dir, request_id)
+                    except OSError as exc:
+                        print('bmcu_plannerd: cannot mark %s busy: %s' %
+                              (request_id, exc), file=sys.stderr, flush=True)
                     result = scan_file(path, expected)
                     payload = {
                         'ok': True,
@@ -182,6 +208,11 @@ def main():
                 except OSError as exc:
                     print('bmcu_plannerd: cannot publish result %s: %s' %
                           (request_id, exc), file=sys.stderr, flush=True)
+                _clear_busy(result_dir, request_id)
+                print('BMCU U1 source planner scanned %s in %.1f s' %
+                      (os.path.basename(path) or '?',
+                       payload['daemon_ms'] / 1000.0),
+                      file=sys.stderr, flush=True)
                 requests += 1
                 if requests % 32 == 0:
                     _cleanup_results(result_dir)

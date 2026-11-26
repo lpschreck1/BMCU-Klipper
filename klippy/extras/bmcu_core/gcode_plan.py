@@ -27,6 +27,8 @@ _TEMP_PARAMETER = re.compile(
     r'(?:^|\s)([ST])\s*=?\s*([-+]?[0-9]+(?:\.[0-9]+)?)',
     re.IGNORECASE)
 
+_MOVE_FIRST_BYTES = (b'G', b'g')
+
 class PlanError(RuntimeError):
     pass
 
@@ -206,6 +208,24 @@ def scan_file(path, expected_identity=None):
                 if len(raw_line) > MAX_LINE_BYTES:
                     raise PlanError(
                         'G-code line exceeds %d bytes' % MAX_LINE_BYTES)
+                # Moves are almost every line of a sliced file and can never
+                # be a header, a temperature command or a tool change, so skip
+                # them before any decoding or regex work.  Comment lines can
+                # only be headers.
+                first = raw_line[:1]
+                if first in _MOVE_FIRST_BYTES:
+                    offset += len(raw_line)
+                    continue
+                if first == b';':
+                    header_match = _HEADER_PATTERN.match(
+                        raw_line.rstrip(b'\r\n'))
+                    if header_match:
+                        key = header_match.group(1).decode(
+                            'ascii', 'ignore').lower()
+                        value = header_match.group(2).decode('ascii', 'ignore')
+                        header_values[key] = parse_temperature_list(value)
+                    offset += len(raw_line)
+                    continue
                 stripped = raw_line.rstrip(b'\r\n')
                 header_match = _HEADER_PATTERN.match(stripped)
                 if header_match:
