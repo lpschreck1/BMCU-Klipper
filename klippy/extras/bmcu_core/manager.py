@@ -9139,10 +9139,13 @@ class BMCUManager(object):
                 next_poll = now + max(minimum_query_interval, poll_interval)
             self.reactor.pause(min(deadline, now + poll_interval))
 
+    FEED_PROGRESS_LOG_S = 10.0
+
     def _wait_feed_operation(self, device, op_id, timeout, endpoint=None,
                              sensor_role='', poll_interval=None,
                              pause_for_critical=False,
-                             interrupt_check=None, cancel_check=None):
+                             interrupt_check=None, cancel_check=None,
+                             channel=None):
         if poll_interval is None:
             poll_interval = (0.100 if endpoint is not None and sensor_role
                              else 0.250)
@@ -9158,6 +9161,14 @@ class BMCUManager(object):
         abort_requested = False
         cancel_requested = False
         next_query = self.reactor.monotonic() + 1.0
+        progress = {'started': self.reactor.monotonic(), 'next': None,
+                    'meters': None}
+        if channel is not None:
+            progress['next'] = progress['started'] + self.FEED_PROGRESS_LOG_S
+            try:
+                progress['meters'] = float(device.status['meters'][channel])
+            except (KeyError, IndexError, TypeError, ValueError):
+                progress['next'] = None
 
         def finish(raw_result):
             result = self._apply_endpoint_sensor_result(
@@ -9280,6 +9291,27 @@ class BMCUManager(object):
                     except Exception:
                         pass
                     next_query = now + 1.0
+                if progress['next'] is not None and now >= progress['next']:
+                    # A slow load (2026-11-26: 99 mm in 100 s) leaves nothing to go
+                    # on without this: how far it got, and what the BMCU was doing.
+                    progress['next'] = now + self.FEED_PROGRESS_LOG_S
+                    try:
+                        status = device.status
+                        moved = (float(status['meters'][channel]) -
+                                 progress['meters']) * 1000.0
+                        logging.info(
+                            'BMCU %s Channel %d feed op %d: %.0f s, %.1f mm moved '
+                            '(%.1f mm/s), buffer %s%%, motor pwm %s, motion %s, '
+                            'present %s, entry sensor %s',
+                            device.name, channel + 1, int(op_id),
+                            now - progress['started'], moved,
+                            moved / max(0.001, now - progress['started']),
+                            status['buffer_pct'][channel],
+                            status['motor_pwm'][channel],
+                            status['motion'][channel],
+                            status['present'][channel], detected)
+                    except Exception:
+                        progress['next'] = None
                 wake = now + poll_interval
                 self.reactor.pause(wake if deadline is None else min(deadline, wake))
             try:
@@ -9302,7 +9334,8 @@ class BMCUManager(object):
             device, op_id, timeout, endpoint, 'entry_sensor',
             poll_interval=poll_interval,
             pause_for_critical=pause_for_critical,
-            interrupt_check=interrupt_check, cancel_check=cancel_check)
+            interrupt_check=interrupt_check, cancel_check=cancel_check,
+            channel=channel)
         result = dict(result or {})
         result['distance_limit_mm'] = float(maximum_mm)
         result['segment_count'] = 1
