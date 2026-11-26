@@ -396,6 +396,32 @@ class Incident9UnrecordedFilamentTest(unittest.TestCase):
         self.assertTrue(any('checking which Channel it is' in l for l in sim.gcode.output))
 
 
+class BufferSlackIdentifyTest(unittest.TestCase):
+    """2026-11-26 on the printer: a failed load left bmcu0 Channel 3's buffer at 82 %.
+    Identifying the Head 4 filament saw 0.0 mm on two Resume presses and 11 mm on the
+    third: the Head's pull came out of the buffer before the encoder turned."""
+
+    def run_with_slack(self):
+        sim = make_sim(self, plan=[[0], [4, 5], [3]],
+                       spools={0: 'PLA grey', 4: 'PLA red', 5: 'PLA blue', 3: 'PLA white'})
+        sim.inject(F.GcodeLine('PRINT_START'), F.Unrecorded('bmcu0'))
+        sim.inject(F.GcodeLine('PRINT_START'), F.BufferSlack('bmcu0', 30.0))
+        return sim
+
+    def test_identified_in_one_go(self):
+        sim = self.run_with_slack()
+        self.assertEqual(sim.run_print(), 'complete', sim.print_stats.message)
+        self.assertTrue(any('Head 3 holds bmcu0 Channel 1' in l for l in sim.gcode.output))
+
+    def test_with_a_single_extrusion_it_is_not_identified(self):
+        sim = self.run_with_slack()
+        with mock.patch.object(M.BMCUManager, 'IDENTIFY_ROUNDS', 1):
+            sim.start()
+            state = sim.run_until_stopped()
+        self.assertNotEqual(state, 'complete')
+        self.assertIn('none of its BMCU Channels moved', sim.print_stats.message)
+
+
 class Incident10HelperStuckTest(unittest.TestCase):
     """A helper that kept the port open with no session after a bad boot (item 12). Replacing
     it is the bootstrap script's job (tests/test_transport_recovery.py covers that); here:

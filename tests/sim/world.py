@@ -78,6 +78,7 @@ class Source(object):
         self.runout_at = None         # spool ends at this p (Runout fault)
         self.present = False          # filament detected at the outlet
         self.assisting = False        # its motor follows the head (see gear_move)
+        self.buffer_slack_mm = 0.0    # filament stored in a compressed buffer (BufferSlack)
 
     # positions along this source's path
     @property
@@ -251,6 +252,14 @@ class World(object):
         source.encoder_mm += moved
         return moved
 
+    def _take_buffer_slack(self, source, mm):
+        # MODEL: when the head pulls, a compressed buffer gives up its stored
+        # filament first, and the BMCU encoder (behind the buffer) does not turn
+        take = min(max(0.0, mm), source.buffer_slack_mm)
+        if take > 0:
+            source.buffer_slack_mm -= take
+            source.encoder_mm -= take
+
     def push(self, source, mm):
         """A source's own wheel pushes its filament ``mm`` forward."""
         source = self.sources[source] if isinstance(source, str) else source
@@ -319,6 +328,7 @@ class World(object):
                 room = 0.0
             step = self._apply(source, min(remaining, max(room, 0.0)))
             moved += step
+            self._take_buffer_slack(source, step)
             if step > 0:
                 item.last_grip_at = self.now
             at_nozzle = source.tip >= source.nozzle_p - 1e-9
@@ -327,6 +337,7 @@ class World(object):
                 # the filament keeps being consumed at the nozzle: the plastic leaves, the
                 # spool and the encoder behind it still move
                 source.encoder_mm += flow
+                self._take_buffer_slack(source, flow)
                 source.spool_mm = max(0.0, source.spool_mm - flow)
                 moved += flow
             item.extruded_mm += flow

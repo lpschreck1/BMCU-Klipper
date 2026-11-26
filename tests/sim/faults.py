@@ -403,6 +403,23 @@ class Unrecorded(Fault):
         sim.world.pull(source, source.tip or 0.0)
 
 
+class BufferSlack(Fault):
+    """The channel's buffer is compressed (seen at 82 % after a load on the real
+    printer, 2026-11-26): the next ``mm`` the head pulls come out of the buffer and
+    the BMCU encoder does not see them."""
+    name = 'buffer_slack'
+
+    def __init__(self, source, mm):
+        self.source = source
+        self.mm = float(mm)
+
+    def apply(self, sim):
+        sim.world.sources[self.source].buffer_slack_mm = self.mm
+
+    def clear(self, sim):
+        sim.world.sources[self.source].buffer_slack_mm = 0.0
+
+
 class BmcuDisconnect(Fault):
     """The USB link goes down; ``duration`` is how long (seconds) until it returns."""
     name = 'bmcu_disconnect'

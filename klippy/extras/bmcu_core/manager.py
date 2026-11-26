@@ -16526,6 +16526,7 @@ class BMCUManager(object):
     IDENTIFY_EXTRUDE_MM = 15.0
     IDENTIFY_MOVED_MM = 6.0      # the channel feeding the Head moves about the extrusion
     IDENTIFY_STILL_MM = 2.0      # every other channel stays below this
+    IDENTIFY_ROUNDS = 3          # extrusions tried before giving up (buffer slack)
 
     def _u1_unaccounted_head_filament(self, endpoint):
         """True when the Head's entry sensor sees filament that neither a loaded
@@ -16640,37 +16641,62 @@ class BMCUManager(object):
             return values
 
         before = meters()
-        self.gcode.run_script_from_command(
-            'SAVE_GCODE_STATE NAME=BMCU_IDENTIFY\nM83\nG1 E%.1f F180\nM400\n'
-            'RESTORE_GCODE_STATE NAME=BMCU_IDENTIFY' % self.IDENTIFY_EXTRUDE_MM)
-        self.reactor.pause(self.reactor.monotonic() + 0.6)
-        after = meters()
-        moved = []
-        for device, channel in candidates:
-            try:
-                delta = abs(float(after[device.name][channel]) -
-                            float(before[device.name][channel])) * 1000.0
-            except (KeyError, IndexError, TypeError, ValueError):
-                delta = 0.0
-            moved.append((delta, device, channel))
-        moved.sort(key=lambda item: -item[0])
+        extruded = 0.0
+        # A buffer left compressed by the load gives up its stored filament first,
+        # so the encoder may not turn on the first extrusion. On the printer
+        # (2026-11-26) the first two 15 mm tries saw 0.0 mm and the third 11 mm.
+        for _round in range(self.IDENTIFY_ROUNDS):
+            self.gcode.run_script_from_command(
+                'SAVE_GCODE_STATE NAME=BMCU_IDENTIFY\nM83\nG1 E%.1f F180\nM400\n'
+                'RESTORE_GCODE_STATE NAME=BMCU_IDENTIFY' % self.IDENTIFY_EXTRUDE_MM)
+            extruded += self.IDENTIFY_EXTRUDE_MM
+            self.reactor.pause(self.reactor.monotonic() + 0.6)
+            after = meters()
+            moved = []
+            for device, channel in candidates:
+                try:
+                    delta = abs(float(after[device.name][channel]) -
+                                float(before[device.name][channel])) * 1000.0
+                except (KeyError, IndexError, TypeError, ValueError):
+                    delta = 0.0
+                moved.append((delta, device, channel))
+            moved.sort(key=lambda item: -item[0])
+            followers = [item for item in moved if item[0] >= self.IDENTIFY_MOVED_MM]
+            if followers:
+                break
         summary = ', '.join('%s Channel %d %.1f mm' % (d.name, c + 1, m)
                             for m, d, c in moved)
-        followers = [item for item in moved if item[0] >= self.IDENTIFY_MOVED_MM]
         unclear = [item for item in moved
                    if self.IDENTIFY_STILL_MM < item[0] < self.IDENTIFY_MOVED_MM]
         if len(followers) != 1 or unclear:
             if not followers and not unclear:
+                uncertain = []
+                for d, c in candidates:
+                    try:
+                        if (self._route_key(d, c) in getattr(
+                                self, '_uncertain_routes', ()) or
+                                self._route_state(d, c) == protocol.ROUTE_UNCERTAIN):
+                            uncertain.append('%s Channel %d' % (d.name, c + 1))
+                    except Exception:
+                        pass
+                if uncertain:
+                    raise BMCUError(
+                        "Head %d has filament at its sensor, but none of its BMCU "
+                        "Channels moved when the Head extruded %.0f mm (%s). %s "
+                        "did not finish loading: push its filament down until the "
+                        "Head's extruder grips it (trim the tip if it is bent), "
+                        "then Resume" % (head + 1, extruded, summary,
+                                         ' or '.join(uncertain)))
                 raise BMCUError(
                     "Head %d has filament BMCU has no record of, and none of its BMCU "
                     "Channels moved when the Head extruded %.0f mm (%s). If it is the "
                     "stock feeder's filament, unload it from the screen; otherwise pull "
                     "it back and start the print again" % (
-                        head + 1, self.IDENTIFY_EXTRUDE_MM, summary))
+                        head + 1, extruded, summary))
             raise BMCUError(
                 'Head %d has filament BMCU has no record of, and extruding %.0f mm '
                 "didn't single out one Channel (%s); pull the filament back and start "
-                'the print again' % (head + 1, self.IDENTIFY_EXTRUDE_MM, summary))
+                'the print again' % (head + 1, extruded, summary))
         _delta, device, channel = followers[0]
         self._adopt_identified_u1_route(device, channel, endpoint, head)
         logging.info('BMCU identified the filament in Head %d as %s Channel %d (%s)',

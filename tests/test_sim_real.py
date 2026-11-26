@@ -359,5 +359,22 @@ class TestPrintTest(unittest.TestCase):
         self.assertEqual(checks.verify(sim), [])
 
 
+class BackToBackTestPrintTest(TestPrintTest):
+    """The same six-band tower sliced with a back-to-back swap on Head 3 (T4 then T5),
+    then T6 into Head 4, stock T1 and T0, and Head 4 handed back to stock T3. Every
+    test of TestPrintTest runs on it too (the pause comes in band 5, stock T0)."""
+
+    def path(self):
+        path = os.path.join(FIXTURES, 'bmcu_test_print_back_to_back.gcode')
+        if not os.path.exists(path):
+            self.skipTest('tests/sim/fixtures/real/bmcu_test_print_back_to_back.gcode '
+                          'not supplied')
+        return path
+
+    def test_it_uses_every_head_the_hand_back_and_the_shared_head_swap(self):
+        sim = run_file(self, self.path())
+        self.assertEqual(sim.planned_tool_changes(), [4, 5, 6, 1, 0, 3])
+
+
 if __name__ == '__main__':
     unittest.main()
