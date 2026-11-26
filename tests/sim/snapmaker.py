@@ -175,7 +175,35 @@ class PrintTaskConfig(object):
                      'SET_PRINT_PREFERENCES'):
             g.register_command(name, lambda gcmd: None)
 
+    def update_filament_exist_flag(self):
+        """print_task_config.py: filament_exist is recomputed from the Head's motion
+        sensor (and its stock feeder's port) on every read, so a value set by hand is
+        overwritten while the sensor says the Head is empty."""
+        feeds = {}
+        for name in ('filament_feed left', 'filament_feed right'):
+            feed = self.sim.printer.lookup_object(name, None)
+            if feed is not None:
+                feeds.update(feed.get_status(0))
+        cfg = self.print_task_config
+        exist = list(cfg['filament_exist'])
+        for ch in range(PHYSICAL_EXTRUDER_NUM):
+            sensor = self.sim.printer.lookup_object(
+                'filament_motion_sensor e%d_filament' % ch, None)
+            feed = feeds.get('extruder%d' % ch)
+            is_exist = True
+            if sensor is not None:
+                status = sensor.get_status(0)
+                if status['enabled'] and not status['filament_detected']:
+                    if (feed is not None and feed['module_exist'] and
+                            not feed['disable_auto']):
+                        is_exist = bool(feed['filament_detected'])
+                    else:
+                        is_exist = False
+            exist[ch] = is_exist
+        cfg['filament_exist'] = exist
+
     def get_status(self, eventtime=None):
+        self.update_filament_exist_flag()
         return copy.deepcopy(self.print_task_config)
 
     def set_head(self, head, vendor='Generic', ftype='PLA', subtype='Basic', exist=True):
@@ -761,7 +789,7 @@ class SnapmakerMacros(object):
         sensor_name = 'e%d_filament' % last
         homed = sim.toolhead.homed_axes
         homed_z = 'z' in homed
-        cfg = sim.print_task_config.print_task_config
+        cfg = sim.print_task_config.get_status()
         is_filament_exist = bool(cfg['filament_exist'][last])
         g = self.g
         if not is_replenish and is_filament_exist:

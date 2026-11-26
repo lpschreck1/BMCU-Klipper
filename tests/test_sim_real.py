@@ -300,6 +300,26 @@ class TestPrintTest(unittest.TestCase):
         sim = run_file(self, self.path())
         self.assertEqual(sim.planned_tool_changes(), [4, 7, 1, 0, 3, 5])
 
+    def _failed_print_start_load(self):
+        # 2026-11-26 on the user's printer: the print-start load of T4 into Head 3
+        # did not arrive and was rolled back EMPTY, so Head 3 was empty.
+        return run_file(self, self.path(), faults=[
+            (F.BmcuMoving('bmcu0', 'load', 50), F.Snag('bmcu0', 120.0))])
+
+    def test_resume_after_a_failed_print_start_load(self):
+        sim = self._failed_print_start_load()
+        out = checks.recover(sim, ('clear_fault',))
+        self.assertEqual((out.state, out.kind), ('complete', 'resumed'), out.messages)
+        self.assertEqual(checks.verify(sim), [])
+
+    def test_negative_control_snapmaker_refuses_an_empty_head(self):
+        from bmcu_core import manager as M
+        with mock.patch.object(M.BMCUManager, '_u1_paused_head', lambda self: None):
+            sim = self._failed_print_start_load()
+            out = checks.recover(sim, ('clear_fault',))
+        self.assertEqual(out.kind, 'stuck')
+        self.assertIn('resume refused: e2 filament runout', out.messages)
+
     def test_pause_in_band_4_then_resume(self):
         class Band4(F.Trigger):
             """The 200th move after the change to band 4 (stock T0)."""

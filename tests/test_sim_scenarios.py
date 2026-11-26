@@ -59,8 +59,11 @@ class Incident1FailedT4LoadTest(unittest.TestCase):
     def test_without_the_projection_fix_resume_is_refused(self):
         sim, _ = self.run_to_first_pause()
         sim.user.clear_fault()
+        # Both fixes off: the projection, and loading the empty Head before
+        # Snapmaker's resume checks (2026-11-26) also rescues this case.
         with mock.patch.object(M.BMCUManager, '_prepare_u1_resume_projection',
-                               lambda self: False):
+                               lambda self: False), \
+                mock.patch.object(M.BMCUManager, '_u1_paused_head', lambda self: None):
             with self.assertRaises(CommandError) as ctx:
                 sim.user.resume()
         self.assertIn('e2 filament runout', str(ctx.exception))

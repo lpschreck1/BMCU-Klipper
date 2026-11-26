@@ -1664,6 +1664,11 @@ class BMCUManager(object):
         pending = getattr(self.refill, 'manual_pending', None)
         if not isinstance(pending, dict):
             self._prepare_u1_resume_projection()
+            head = self._u1_paused_head()
+            if head is not None:
+                # Snapmaker's RESUME refuses an empty Head ("eN filament runout")
+                # before its own auto-feed runs: load the BMCU source first.
+                self._u1_resume_load_bmcu_source(head, gcmd)
             return original(gcmd)
         try:
             self.refill.resume_manual_refill(gcmd=gcmd)
@@ -1867,7 +1872,25 @@ class BMCUManager(object):
                                phase='RESUME', details=str(exc))
             raise self._command_pause_error(gcmd, exc)
 
+    def _u1_paused_head(self):
+        if not self.print_map_active or not self._snapmaker_platform():
+            return None
+        macro = self.printer.lookup_object('gcode_macro INNER_RESUME', None)
+        try:
+            head = int((getattr(macro, 'variables', {}) or {}).get(
+                'last_extruder_index', -1))
+        except (TypeError, ValueError):
+            return None
+        return head if head >= 0 else None
+
     def _u1_resume_feed_loads_bmcu_source(self, gcmd):
+        try:
+            head = int(gcmd.get_int('EXTRUDER', -1))
+        except Exception:
+            return False
+        return self._u1_resume_load_bmcu_source(head, gcmd)
+
+    def _u1_resume_load_bmcu_source(self, head, gcmd):
         """F9: Snapmaker's resume reloads the paused Head with SM_PRINT_AUTO_FEED
         and then checks its filament sensor. When the Head is empty because a
         BMCU load failed (a background prestage, after the old filament was
@@ -1876,10 +1899,6 @@ class BMCUManager(object):
         here instead; the re-run tool change then finds it loaded."""
         if (self._u1_stock_feed_inner or not self.print_map_active or
                 self._print_state() not in ('printing', 'paused', 'pause')):
-            return False
-        try:
-            head = int(gcmd.get_int('EXTRUDER', -1))
-        except Exception:
             return False
         endpoint = self._u1_endpoint_for_head(head)
         if (endpoint is None or
