@@ -114,9 +114,16 @@ def trim_lines(lines, every=12, edge=6, context=30, lean=False):
         nonlocal carry
         total = len(layer_moves)
         chosen = set()
+        first_z = True
         for position, index in enumerate(layer_moves):
+            has_z = bool(Z_WORD.search(lines[index]))
+            # --lean keeps only a layer's first Z move: Orca lifts Z on every travel
+            # (a Z-hop), and nothing in BMCU or the simulator reads those.
+            keep_z = has_z and (first_z or not lean)
+            if has_z:
+                first_z = False
             if (keep[index] or position < edge or position >= total - edge or
-                    position % every == 0 or Z_WORD.search(lines[index])):
+                    position % every == 0 or keep_z):
                 chosen.add(index)
         pending = 0.0
         for index in range(layer_start, end):
