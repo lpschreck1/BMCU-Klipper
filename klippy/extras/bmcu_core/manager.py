@@ -16738,6 +16738,36 @@ class BMCUManager(object):
             return True
         return settled
 
+    def _settle_u1_uncertain_for_print_start(self, endpoint, gcmd=None):
+        """F18: a Channel left UNCERTAIN on this Head (a failed load, then the
+        print cancelled without confirming the route) made the next print fail at
+        BMCU_PRINT_COMMIT with 'feeder owner is bmcu_busy', which cannot be
+        resumed. Settle it the way a Resume does (F8): identify filament the Head
+        sensor sees, or finish the pullback when the sensor is clear. Only when
+        nothing is moving: no operation in flight and no background job."""
+        if getattr(endpoint, 'driver', '') != 'snapmaker_u1':
+            return False
+        if self.active_operations or endpoint.name in self._u1_background_jobs:
+            return False
+        evidence = self._u1_endpoint_ownership_evidence(endpoint.name)
+        if any(item['inflight'] for item in evidence):
+            return False
+        if not any(item['raw_state'] == protocol.ROUTE_UNCERTAIN or
+                   item['route_key'] in self._uncertain_routes
+                   for item in evidence):
+            return False
+        logging.info('BMCU %s has an UNCERTAIN route at print start; settling it',
+                     endpoint.name)
+        try:
+            return bool(self._settle_u1_routes_after_reconnect(endpoint, gcmd))
+        except Exception as exc:
+            logging.exception('BMCU could not settle %s at print start',
+                              endpoint.name)
+            raise BMCUError(
+                '%s has an UNCERTAIN route that could not be settled at print '
+                'start: %s. Confirm the route in the BMCU panel, then start the '
+                'print again' % (endpoint.name, exc))
+
     def _adopt_live_empty_u1_route(self, device, channel, endpoint):
         route_key = self._route_key(device, channel)
         logging.warning(
@@ -17570,6 +17600,10 @@ class BMCUManager(object):
 
                     self._reconcile_u1_leases(
                         self.reactor.monotonic(), force=True)
+                    owner = self._u1_owner_status(endpoint)
+                    owner_name = owner.get('owner', 'unknown')
+                if (owner_name == 'bmcu_busy' and
+                        self._settle_u1_uncertain_for_print_start(endpoint, gcmd)):
                     owner = self._u1_owner_status(endpoint)
                     owner_name = owner.get('owner', 'unknown')
                 if owner_name == 'native':

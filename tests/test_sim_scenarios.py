@@ -157,6 +157,49 @@ class Incident11PulledBackBeforeTheHeadTest(unittest.TestCase):
         self.assertIn('e2_filament runout', sim.print_stats.message)
 
 
+class F18UncertainAfterCancelTest(unittest.TestCase):
+    """F18: a print-start load stops in Head 3 (coil check fails), the user cancels and
+    starts the next print without confirming the route, so the Channel is still
+    UNCERTAIN. The next print must not fail with 'feeder owner is bmcu_busy' (an
+    error, which cannot be resumed): print start settles the route first."""
+
+    def cancelled(self, pull_back_mm=None):
+        sim = make_sim(self, plan=[[5]], spools={5: 'PLA red', 4: 'PLA black'})
+        sim.inject(F.GcodeLine('BMCU_AUTO_FEED EXTRUDER=2'), F.Clog(2))
+        sim.start()
+        self.assertIn('U1_TOOLHEAD_NOT_LOADED', sim.run_until_pause().message)
+        sim.user.clear_fault()
+        sim.user.cancel()
+        if pull_back_mm is not None:
+            source = sim.world.sources['bmcu1']
+            sim.world.pull(source, source.tip - (source.sensor_p - pull_back_mm))
+            sim.settle(2.0)
+        sim.slice([[4]])
+        return sim
+
+    def test_filament_still_in_the_head(self):
+        sim = self.cancelled()
+        sim.start()
+        self.assertEqual(sim.run_until_stopped(), 'complete', sim.print_stats.message)
+        self.assertEqual(sim.world.consistent(), [])
+
+    def test_filament_pulled_back_behind_the_sensor(self):
+        sim = self.cancelled(pull_back_mm=30.0)
+        sim.start()
+        self.assertEqual(sim.run_until_stopped(), 'complete', sim.print_stats.message)
+        self.assertEqual(sim.sensors[2].runout_helper.runout_events, 0)
+        self.assertEqual(sim.world.consistent(), [])
+
+    def test_without_the_fix_the_print_fails(self):
+        sim = self.cancelled()
+        with mock.patch.object(M.BMCUManager, '_settle_u1_uncertain_for_print_start',
+                               lambda self, endpoint, gcmd=None: False):
+            sim.start()
+            state = sim.run_until_stopped()
+        self.assertEqual(state, 'error')
+        self.assertIn('feeder owner is bmcu_busy', sim.print_stats.message)
+
+
 class Incident3FlushRetractTest(unittest.TestCase):
     """T6->T3 on head 4: BMCU's tip shaping and pullback leave printing_e_pos at about
     -67.5 mm, so Snapmaker's flush would retract the new stock filament that far and the
