@@ -611,6 +611,11 @@ class User(object):
                 elif source.tip is None or source.tip <= 0:
                     state = 'EMPTY'
                 else:
+                    # PARKED means the printer route is empty (docs/COMMANDS.md): a
+                    # tip still past the splitter is pulled back by hand first, or
+                    # the user would be confirming something false.
+                    if source.past(source.splitter_p):
+                        sim.world._apply(source, source.splitter_p - 50.0 - source.tip)
                     state = 'PARKED'
                 sim.run_gcode('BMCU_ROUTE_CONFIRM DEVICE=%s CHANNEL=%d STATE=%s' % (
                     device['name'], channel['channel'], state))

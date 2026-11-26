@@ -163,10 +163,14 @@ class SweepOutcomesTest(unittest.TestCase):
             return 'F10' if 'deformed' in fault else 'F9'
         return None
 
+    # Findings fixed in claude-fixes: a case they explained going bad again is a
+    # regression, not a known finding.
+    FIXED = frozenset(('F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12'))
+
     def test_every_case_is_recoverable_or_a_known_finding(self):
         from sim import sweep
         sections = sweep.cached_sweep()
-        unexplained, fixed = set(), set()
+        unexplained, regressed, fixed = set(), set(), set()
         for title, _intro, rows in sections[1:]:
             for point, fault, kind, detail in rows:
                 finding = self.finding_for(title, point, fault, kind, detail)
@@ -174,10 +178,20 @@ class SweepOutcomesTest(unittest.TestCase):
                        'cannot replace the active BMCU print plan' in detail)
                 if bad and finding is None:
                     unexplained.add((title, point, fault))
-                if not bad and finding is not None:
+                elif bad and finding in self.FIXED:
+                    regressed.add((title, point, fault, finding))
+                if not bad and finding is not None and finding not in self.FIXED:
                     fixed.add((title, point, fault))
         self.assertEqual(unexplained, set(), 'new unrecoverable cases')
+        self.assertEqual(regressed, set(), 'a fixed finding came back')
         self.assertEqual(fixed, set(), 'fixed: update finding_for and FINDINGS.md')
+
+    def test_the_first_sweep_has_no_stuck_case_either(self):
+        from sim import sweep
+        rows = sweep.cached_sweep()[0][2]
+        self.assertEqual(
+            [(point, fault) for point, fault, kind, _detail in rows
+             if kind in ('stuck', 'dirty')], [])
 
 
 class Findings(unittest.TestCase):
@@ -190,18 +204,15 @@ class Findings(unittest.TestCase):
         return sim, outcome
 
     # F5 ---------------------------------------------------------------------------
-    @unittest.expectedFailure
     def test_f5_cable_glitch_during_a_load_can_be_resumed(self):
         sim, outcome = self.disconnect(F.BmcuMoving('bmcu0', 'load', 50), 3.0)
         self.assertEqual(outcome.state, 'complete', outcome.messages[-1:])
 
-    @unittest.expectedFailure
     def test_f5_cable_glitch_in_before_on_use_can_be_resumed_without_dry_printing(self):
         sim, outcome = self.disconnect(F.BeforeOnUse(2), 3.0)
         self.assertEqual(outcome.state, 'complete', outcome.messages[-1:])
         self.assertEqual(checks.verify(sim), [])
 
-    @unittest.expectedFailure
     def test_f5_helper_exit_mid_print_can_be_resumed_after_repair(self):
         sim = make_sim(self)
         sim.inject(F.Idle(40.0), F.HelperExit(None))
@@ -231,7 +242,6 @@ class Findings(unittest.TestCase):
         self.assertEqual(outcome.state, 'complete', outcome.messages[-1:])
 
     # F6 ---------------------------------------------------------------------------
-    @unittest.expectedFailure
     def test_f6_cable_glitch_at_idle_leaves_the_device_ready_again(self):
         sim = make_sim(self)
         device = sim.manager.devices[0]
@@ -242,7 +252,6 @@ class Findings(unittest.TestCase):
         self.assertTrue(device.ready)
 
     # F7 ---------------------------------------------------------------------------
-    @unittest.expectedFailure
     def test_f7_the_pause_for_a_lost_cable_says_to_check_the_cable(self):
         sim = make_sim(self)
         sim.inject(F.BmcuMoving('bmcu0', 'load', 50), F.BmcuDisconnect(None))
@@ -251,25 +260,21 @@ class Findings(unittest.TestCase):
         self.assertRegex(sim.print_stats.message, r'(?i)cable|usb|plug|connection')
 
     # F8 ---------------------------------------------------------------------------
-    @unittest.expectedFailure
     def test_f8_cable_glitch_during_an_unload_can_be_resumed(self):
         sim, outcome = self.disconnect(F.BmcuMoving('bmcu0', 'unload', 50), 3.0)
         self.assertEqual(outcome.state, 'complete', outcome.messages[-1:])
 
-    @unittest.expectedFailure
     def test_f8_cable_glitch_during_a_prestage_can_be_resumed(self):
         sim, outcome = self.disconnect(F.Prestaging(5), 3.0)
         self.assertEqual(outcome.state, 'complete', outcome.messages[-1:])
 
     # F9 ---------------------------------------------------------------------------
-    @unittest.expectedFailure
     def test_f9_a_snag_in_the_background_prestage_can_be_resumed(self):
         sim = make_sim(self)
         sim.inject(F.Prestaging(5), F.Snag('bmcu1', 58.0))
         outcome = checks.recover(sim, ('clear_fault',))
         self.assertEqual(outcome.state, 'complete', outcome.messages[-1:])
 
-    @unittest.expectedFailure
     def test_f9_a_runout_in_the_background_prestage_can_be_resumed(self):
         sim = make_sim(self)
         sim.inject(F.Prestaging(5), F.Runout('bmcu1'))
@@ -277,7 +282,6 @@ class Findings(unittest.TestCase):
         self.assertEqual(outcome.state, 'complete', outcome.messages[-1:])
 
     # F10 --------------------------------------------------------------------------
-    @unittest.expectedFailure
     def test_f10_deformed_tip_on_a_tool_change_load_resumes_without_dry_printing(self):
         sim = make_sim(self)
         sim.inject(F.Prestaging(5), F.DeformedTip('bmcu1'))

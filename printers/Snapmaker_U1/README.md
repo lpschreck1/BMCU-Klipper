@@ -198,6 +198,32 @@ PAUSE
 
 The pending replacement state remains active until `LOAD` completes successfully, so another `Resume` attempt can be made after adding filament or removing the cause of the error.
 
+## Pauses you can resume
+
+Every BMCU pause is meant to be resumable: fix what the message says, then press
+Resume.
+
+- **The BMCU loses its USB link, or its transport helper stops.** The pause says to check
+  the BMCU's USB cable and hub. BMCU reconnects by itself within a few seconds of the
+  link coming back, resyncs while the print is paused, and Resume then continues.
+- **A load or unload was cut short by the disconnect.** On Resume, BMCU trusts what the
+  BMCU reports, cross-checked with the Head's filament sensor. If the BMCU says the
+  route is empty, BMCU records it as empty. If it doesn't know and the Head sensor sees
+  filament, BMCU identifies the filament with a short extrusion. If the Head sensor is
+  clear, BMCU finishes the pullback; the firmware stops on its own at its sensor. You
+  don't need `BMCU_ROUTE_CONFIRM` during the print.
+- **Filament BMCU didn't load itself is in a Head** (identified at print start or on
+  Resume). BMCU purges the load-to-nozzle distance plus the normal prime at the discard
+  position before printing, because the tip may stop short of the nozzle.
+- **A background load for a later change fails** (a snag or runout while staging). After
+  you clear it, Resume loads that Head's next BMCU source before the printer checks its
+  sensor.
+- **Snapmaker's own stock load fails** (`move_extrude`). The pause names the Head, counted
+  from 1 as on the screen, and says to recut the tip and check the nozzle.
+- **Power loss.** Take the printer's power-loss resume. BMCU keeps the saved print plan
+  and restores its tool maps and tool-change plan when the resumed print first needs BMCU.
+  If you start a different print instead, it replaces the old plan.
+
 ## OrcaSlicer and Snapmaker Orca
 
 The panel generates the profile:

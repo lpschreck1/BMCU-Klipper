@@ -182,25 +182,21 @@ class RestartSweepTest(unittest.TestCase):
 class Findings(unittest.TestCase):
     """Fail today; rows F8, F11 and F12 of tests/sim/FINDINGS.md."""
 
-    @unittest.expectedFailure
     def test_f11_the_first_print_after_a_klipper_restart_is_not_refused(self):
         outcome, detail = sweep.run_restart_case('klipper', F.Idle(300.0))
         self.assertNotIn('cannot replace the active BMCU print plan', detail)
         self.assertIn(outcome, ('no_effect', 'resumed'))
 
-    @unittest.expectedFailure
     def test_f12_power_loss_resume_during_the_print_start_load_continues(self):
         outcome, detail = sweep.run_restart_case(
             'power', F.BmcuMoving('bmcu0', 'load', 50))
         self.assertIn(outcome, ('no_effect', 'resumed'), detail)
 
-    @unittest.expectedFailure
     def test_f8_power_loss_during_an_unload_can_be_resumed(self):
         outcome, detail = sweep.run_restart_case(
             'power', F.BmcuMoving('bmcu0', 'unload', 50))
         self.assertIn(outcome, ('no_effect', 'resumed'), detail)
 
-    @unittest.expectedFailure
     def test_f8_power_loss_with_a_durable_write_still_queued_can_be_resumed(self):
         def lag(sim):
             sim.bmcu.write_lag = 5.0

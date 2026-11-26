@@ -2260,7 +2260,7 @@ class SnapmakerU1Endpoint(Endpoint):
     # extruder caught up. Keep the flush's retract to Snapmaker's own default.
     NATIVE_FLUSH_RETRACT_CAP_MM = 5.0
 
-    def _limit_native_flush_retract(self):
+    def _limit_native_flush_retract(self, when='stock load', before='the flush'):
         extruder = self.printer.lookup_object(self._configured_extruder_name(), None)
         try:
             pending = float(getattr(extruder, 'printing_e_pos'))
@@ -2270,10 +2270,16 @@ class SnapmakerU1Endpoint(Endpoint):
         if limited != pending:
             extruder.printing_e_pos = limited
         logging.info(
-            'BMCU U1 head %d stock load: pending retract %.1f mm before the flush%s',
-            self._head() + 1, -pending,
+            'BMCU U1 head %d %s: pending retract %.1f mm before %s%s',
+            self._head() + 1, when, -pending, before,
             '' if limited == pending else ', limited to %.1f mm' % -limited)
         return pending
+
+    def limit_resume_retract(self):
+        """Snapmaker's RESUME retracts by the pending printing_e_pos, which also
+        counts BMCU's own unload moves made while printing. Left alone it pulls
+        a freshly loaded tip back out of the nozzle and the print resumes dry."""
+        return self._limit_native_flush_retract('resume', "Snapmaker's resume")
 
     def prepare_native_stock_load(self, printing=True):
         """Before Snapmaker's stock load at print start: clear a lagging head-sensor
@@ -3739,13 +3745,16 @@ class SnapmakerU1Endpoint(Endpoint):
             'coil_final_reads': int(reads),
         }
 
-    def _native_preextrude(self, material='', refill=False, temperature_profile=None):
+    def _native_preextrude(self, material='', refill=False, temperature_profile=None,
+                           length=None):
         context = self._active_load_context(material, temperature_profile)
-        key = 'u1_refill_prime_length_mm' if refill else 'u1_prime_length_mm'
-        length = float(self.get(key, 20.0) or 20.0)
         soft = bool(context['soft'])
-        if soft:
-            length = 10.0
+        if length is None:
+            key = 'u1_refill_prime_length_mm' if refill else 'u1_prime_length_mm'
+            length = float(self.get(key, 20.0) or 20.0)
+            if soft:
+                length = 10.0
+        length = float(length)
         speed = 120.0 if soft else 360.0
         logging.info(
             'BMCU Snapmaker Head %d prime start: material=%s load=%.1fC '
@@ -3809,6 +3818,29 @@ class SnapmakerU1Endpoint(Endpoint):
             except Exception:
                 logging.exception(
                     'BMCU could not restore U1 action state after pre-extrude')
+
+    def prime_unknown_tip(self, material='', temperature_profile=None):
+        """Purge filament whose tip position BMCU doesn't know (found in the
+        Head, or left there by an interrupted load) until it is surely at the
+        nozzle: the load-to-nozzle distance plus the normal prime, at the
+        discard position. Extra purge is harmless; printing with an empty
+        nozzle is not."""
+        if not self._native_hotend_sequences_enabled():
+            return False
+        to_nozzle = _coerce_finite_float(self.get('u1_load_to_nozzle_mm', 70.0))
+        if to_nozzle is None or not 1.0 <= to_nozzle <= 300.0:
+            to_nozzle = 70.0
+        prime = _coerce_finite_float(self.get('u1_prime_length_mm', 20.0))
+        if prime is None or prime < 0.0:
+            prime = 20.0
+        logging.info(
+            'BMCU Snapmaker Head %d tip position unknown; purging %.1f mm to '
+            'be sure the nozzle is full before printing',
+            self._head() + 1, to_nozzle + prime)
+        self._native_preextrude(material, refill=False,
+                                temperature_profile=temperature_profile,
+                                length=to_nozzle + prime)
+        return True
 
     def prime(self, material='', temperature_profile=None):
         if not self._native_hotend_sequences_enabled():

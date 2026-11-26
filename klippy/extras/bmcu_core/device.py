@@ -630,6 +630,9 @@ class BMCUDevice(object):
         self.last_rx_seq = None
         self.status_reconciled = False
         self.slot_sync_required = True
+        # F6: an unchanged BMCU reports the same status after a reconnect; it
+        # must still reach the manager, which is what makes the device ready.
+        self._last_manager_status_fingerprint = None
 
     def _handle_ipc_message(self, eventtime, message):
         op, arg1, arg2, arg3, payload = message

@@ -44,16 +44,30 @@ U1_PLANNER_BUSY_LIMIT_S = 600.0
 _SNAPMAKER_EXTRUDER_ERROR = re.compile(r'extruder\[(\d+)\][^!]*error:\s*move_extrude')
 
 
+_BMCU_LINK_LOST = re.compile(
+    r'DEVICE_OFFLINE|serial port is not ready|sidecar hangup|is offline\b|'
+    r'control plane did not resume|sidecar IPC unavailable', re.IGNORECASE)
+_BMCU_LINK_HINT = (
+    'The BMCU lost its USB connection, or its transport helper stopped. Check '
+    "the BMCU's USB cable and hub; BMCU reconnects by itself within a few "
+    'seconds of the link coming back. Then Resume')
+
+
 def _with_stock_feed_hint(message):
-    """Snapmaker's own load errors don't say what to do; add it."""
+    """Snapmaker's and the transport's errors don't say what to do; add it."""
     message = str(message or '')
+    hint = ''
     match = _SNAPMAKER_EXTRUDER_ERROR.search(message)
-    if match is None or 'could not grip it' in message:
+    if match is not None and 'could not grip it' not in message:
+        hint = ('Head %d: the stock feeder pushed the filament to the head but '
+                'the extruder could not grip it. Pull the filament out, cut the '
+                'tip clean at an angle, check the nozzle isn\'t clogged, then '
+                'Resume' % (int(match.group(1)) + 1))
+    elif (_BMCU_LINK_LOST.search(message) and
+          _BMCU_LINK_HINT not in message):
+        hint = _BMCU_LINK_HINT
+    if not hint:
         return message
-    hint = ('Head %d: the stock feeder pushed the filament to the head but the '
-            'extruder could not grip it. Pull the filament out, cut the tip clean '
-            'at an angle, check the nozzle isn\'t clogged, then Resume' %
-            (int(match.group(1)) + 1))
     base = message.rstrip()
     return '%s%s%s' % (base, ' ' if base.endswith(('.', '!')) else '. ', hint)
 GENERIC_EXTERNAL_TOOL = 0
@@ -289,6 +303,10 @@ class BMCUManager(object):
         self.print_plan_schema = PRINT_PLAN_SCHEMA
         self.print_job_id = str(session.get('job_id', '') or '')
         self.print_map_active = bool(session.get('active', False))
+        # F11: a plan restored from before this Klipper start. A BMCU_PRINT_BEGIN
+        # can only come from a file run from its top, so it is a new print and
+        # may replace it even though Snapmaker already reports "printing".
+        self._print_session_from_previous_boot = self.print_map_active
         self._u1_map_backup = copy.deepcopy(session.get('u1_map_backup', {})) \
             if isinstance(session.get('u1_map_backup', {}), dict) else {}
         self._u1_used_backup = copy.deepcopy(session.get('u1_used_backup', {})) \
@@ -1670,7 +1688,9 @@ class BMCUManager(object):
         cursor = getattr(self, '_u1_toolchange_cursor', -1)
         plan = getattr(self, '_u1_toolchange_plan', []) or []
         if isinstance(cursor, int) and 0 <= cursor < len(plan):
-            tools.append(plan[cursor].get('tool', -1))
+            # The change in progress, then the ones after it: a failed
+            # background prestage is for a later change on this Head (F9).
+            tools.extend(item.get('tool', -1) for item in plan[cursor:])
         route = self._first_u1_route_for_endpoint(endpoint.name)
         if route is not None:
             tools.append(route.get('tool', -1))
@@ -1679,10 +1699,13 @@ class BMCUManager(object):
                 route = self._u1_logical_route(int(tool))
             except (TypeError, ValueError):
                 continue
-            if (route is None or route.get('kind') != 'bmcu' or
-                    route.get('endpoint') is None or
+            if (route is None or route.get('endpoint') is None or
                     route['endpoint'].name != endpoint.name):
                 continue
+            if route.get('kind') != 'bmcu':
+                # The Head's next source is its stock feeder (a hybrid Head):
+                # leave the resume to it.
+                return None
             device, channel, _target = self._resolve_tool(int(tool))
             return device, channel
         return None
@@ -1701,6 +1724,8 @@ class BMCUManager(object):
             endpoint = self._u1_endpoint_for_head(head)
             if endpoint is None or not self._assigned_routes_for_endpoint(endpoint.name):
                 return False
+            if hasattr(endpoint, 'limit_resume_retract'):
+                endpoint.limit_resume_retract()
             route = self._u1_resume_route(endpoint)
             if route is None:
                 return False
@@ -1800,6 +1825,8 @@ class BMCUManager(object):
             raise gcmd.error('stock SM_PRINT_AUTO_FEED handler is unavailable')
         if self._u1_resume_feed_runs_pending_recovery(gcmd):
             return None
+        if self._u1_resume_feed_loads_bmcu_source(gcmd):
+            return None
         endpoint = self._u1_stock_print_endpoint(gcmd)
         if endpoint is not None:
             try:
@@ -1838,6 +1865,71 @@ class BMCUManager(object):
             self._record_error('U1_RESUME_RECOVERY_FAILED', endpoint=endpoint.name,
                                phase='RESUME', details=str(exc))
             raise self._command_pause_error(gcmd, exc)
+
+    def _u1_resume_feed_loads_bmcu_source(self, gcmd):
+        """F9: Snapmaker's resume reloads the paused Head with SM_PRINT_AUTO_FEED
+        and then checks its filament sensor. When the Head is empty because a
+        BMCU load failed (a background prestage, after the old filament was
+        already unloaded), the stock feeder has nothing to load, so the check
+        fails and every Resume is refused. Load the Head's next BMCU source
+        here instead; the re-run tool change then finds it loaded."""
+        if (self._u1_stock_feed_inner or not self.print_map_active or
+                self._print_state() not in ('printing', 'paused', 'pause')):
+            return False
+        try:
+            head = int(gcmd.get_int('EXTRUDER', -1))
+        except Exception:
+            return False
+        endpoint = self._u1_endpoint_for_head(head)
+        if (endpoint is None or
+                not self._assigned_routes_for_endpoint(endpoint.name)):
+            return False
+        try:
+            # A failed load can leave its route UNCERTAIN; settle it first.
+            self._settle_u1_routes_after_reconnect(endpoint, gcmd)
+        except Exception as exc:
+            self._record_error('U1_RESUME_LOAD_FAILED', endpoint=endpoint.name,
+                               phase='RESUME', details=str(exc))
+            raise self._command_pause_error(gcmd, exc)
+        if self._loaded_devices_for_endpoint(endpoint.name):
+            return False
+        if any(item['raw_state'] != protocol.ROUTE_EMPTY or item['inflight']
+               for item in self._u1_endpoint_ownership_evidence(endpoint.name)):
+            return False
+        try:
+            native = endpoint.native_path_status()
+        except Exception:
+            native = {}
+        if native.get('busy'):
+            # The stock feeder holds this Head's path (its own load failed):
+            # the resume is the stock feeder's to retry.
+            return False
+        route = self._u1_resume_route(endpoint)
+        if route is None:
+            return False
+        device, channel = route
+        present = (getattr(device, 'status', {}) or {}).get('present') or []
+        if not (channel < len(present) and present[channel]):
+            return False
+        tool = self._virtual_tool_for_source(device, channel)
+        if tool is None or int(tool) < 0:
+            return False
+        logging.info('BMCU resume: Head %d is empty; loading T%d from %s Channel %d '
+                     'before the printer checks its sensor', head + 1, int(tool),
+                     device.name, channel + 1)
+        previous_profile = getattr(self, '_u1_pending_temperature_profile', None)
+        try:
+            self._prepare_native_path_for_bmcu(endpoint, device, channel)
+            self._u1_pending_temperature_profile = self._u1_temperature_profile(
+                None, tool=int(tool))
+            self.load_tool(int(tool), gcmd)
+        except Exception as exc:
+            self._record_error('U1_RESUME_LOAD_FAILED', endpoint=endpoint.name,
+                               phase='RESUME', details=str(exc))
+            raise self._command_pause_error(gcmd, exc)
+        finally:
+            self._u1_pending_temperature_profile = previous_profile
+        return True
 
     def _u1_stock_print_endpoint(self, gcmd):
         """The Head this SM_PRINT_AUTO_FEED loads, when it needs BMCU's attention: a
@@ -2265,6 +2357,21 @@ class BMCUManager(object):
             return True
         return self._printer_background_busy(eventtime)
 
+    # Deferred work that only re-syncs a reconnected BMCU's state. It is safe
+    # while a print is paused, and Resume depends on it after a replug (F5).
+    _PAUSED_SAFE_DEFERRED_PREFIXES = (
+        'device-status-reconcile:', 'runtime-sync:', 'slot-sync:')
+
+    def _paused_safe_deferred_index(self, eventtime=None):
+        if self._print_state() not in ('paused', 'pause'):
+            return None
+        if self._printer_background_busy(eventtime):
+            return None
+        for index, (key, _callback) in enumerate(self._deferred_tasks):
+            if key and key.startswith(self._PAUSED_SAFE_DEFERRED_PREFIXES):
+                return index
+        return None
+
     def _printer_transport_safe(self, eventtime=None):
         if self._critical_motion_active or self._klippy_disconnecting:
             return False
@@ -2508,9 +2615,17 @@ class BMCUManager(object):
         if not self._deferred_tasks:
             return self.reactor.NEVER
         if self._printer_deferred_busy(eventtime):
-            self._background_busy_deferrals += 1
-            return self.reactor.monotonic() + self._background_retry_interval
-        key, callback = self._deferred_tasks.popleft()
+            index = self._paused_safe_deferred_index(eventtime)
+            if index is None:
+                self._background_busy_deferrals += 1
+                return self.reactor.monotonic() + self._background_retry_interval
+            # F5: reconnect bookkeeping runs while paused, or Resume after a
+            # replug is refused forever. Nothing here moves filament; the
+            # other queued tasks keep their order and stay held.
+            key, callback = self._deferred_tasks[index]
+            del self._deferred_tasks[index]
+        else:
+            key, callback = self._deferred_tasks.popleft()
         if key:
             self._deferred_task_keys.discard(key)
         started = self.reactor.monotonic()
@@ -2922,6 +3037,14 @@ class BMCUManager(object):
             self._pending_device_status[key] = (
                 device, pending[1], dict(current))
             self._status_reconcile_coalesced += 1
+        if not getattr(device, 'runtime_configured', True):
+            # F5: a BMCU that reconnected mid-print needs the full reconcile
+            # (runtime sync) to become ready again. Queue it now; it runs as
+            # soon as the print is paused instead of only after it ends.
+            self._queue_deferred_task(
+                'device-status-reconcile:%s' % key,
+                lambda eventtime, name=key:
+                    self._process_queued_device_status(eventtime, name))
 
         previous_present = list(previous.get('present', [0, 0, 0, 0]))
         current_present = list(current.get('present', [0, 0, 0, 0]))
@@ -5582,6 +5705,30 @@ class BMCUManager(object):
         raise BMCUError(
             'AUTO_REFILL_RESUME_FAILED: printer did not confirm cross-head RESUME')
 
+    def _restore_u1_print_after_restart(self):
+        """F12: a power-loss resume continues a print below its BMCU plan block, so
+        BMCU_PRINT_BEGIN never runs again. Bring back what that block set up, from
+        the saved session: Snapmaker's tool maps (the boot task for them is held
+        while the restore reports "printing") and the tool-change plan, which comes
+        from scanning the same file."""
+        if (not getattr(self, '_print_session_from_previous_boot', False) or
+                not self.print_map_active or not self._snapmaker_platform()):
+            return False
+        self._print_session_from_previous_boot = False
+        for index, (key, _callback) in enumerate(list(self._deferred_tasks)):
+            if key == 'reapply-u1-print-maps':
+                del self._deferred_tasks[index]
+                break
+        logging.info('BMCU restoring the print plan from before the restart '
+                     '(job %s) for the resumed print', self.print_job_id or 'unknown')
+        self._reapply_u1_print_maps()
+        if not self._u1_toolchange_plan:
+            try:
+                self._load_u1_toolchange_plan()
+            except Exception:
+                logging.exception('BMCU could not rescan the resumed print file')
+        return True
+
     def _reapply_u1_print_maps(self):
         if not self.print_map_active:
             return False
@@ -6882,6 +7029,27 @@ class BMCUManager(object):
             self._channel_endpoint_name(device, channel) == endpoint_name
             for name, channel in self._u1_background_channel_locks)
 
+    def _u1_device_endpoint_unsettled(self, device, endpoint_name):
+        """Like _u1_device_endpoint_unsafe, but a route the reconnected BMCU
+        reports as LOADED or EMPTY counts as settled."""
+        channels = self._u1_routes_for_device_endpoint(device, endpoint_name)
+        if any(self._route_state(device, channel) not in (
+                protocol.ROUTE_EMPTY, protocol.ROUTE_LOADED)
+               for channel in channels):
+            return True
+        if any(key.startswith(device.name + ':') and
+               isinstance(value, dict) and value.get('endpoint') == endpoint_name
+               for key, value in self.prestaged.items()):
+            return True
+        operation = self.active_operations.get(device.name)
+        if (isinstance(operation, dict) and
+                operation.get('endpoint') == endpoint_name):
+            return True
+        return any(
+            name == device.name and
+            self._channel_endpoint_name(device, channel) == endpoint_name
+            for name, channel in self._u1_background_channel_locks)
+
     def _set_u1_disconnect_hazard(self, endpoint_name, device_name,
                                   kind, message):
         endpoint_name = str(endpoint_name or '')
@@ -6957,8 +7125,11 @@ class BMCUManager(object):
                 fresh = bool(
                     device.ready and device.runtime_configured and
                     device.status_reconciled)
+                # Once the BMCU is back and has reported fresh state, trust
+                # it: a LOADED route it confirms is no longer a hazard. Only
+                # an unresolved route or work still in flight keeps the hold.
                 if (not fresh or
-                        self._u1_device_endpoint_unsafe(device, name)):
+                        self._u1_device_endpoint_unsettled(device, name)):
                     remaining.add(device_name)
             reasons = self._u1_disconnect_hazard_reasons.get(name, {})
             for cleared in existing - remaining:
@@ -12349,6 +12520,8 @@ class BMCUManager(object):
             background_job.get('endpoint') is endpoint and
             background_job.get('state') in ('handoff', 'ready', 'partial'))
 
+        # Routes still in flight (a verified prestage) are left alone here.
+        self._settle_u1_routes_after_reconnect(endpoint, gcmd)
         self._validate_endpoint_for_operation(
             endpoint, require_u1_ownership=False)
         self._reconcile_u1_pending_follower_commit(endpoint)
@@ -12432,6 +12605,16 @@ class BMCUManager(object):
                     self._rearm_snapmaker_detached_tail_monitor(
                         device, channel, tool, endpoint)
                 if endpoint.driver == 'snapmaker_u1':
+                    unverified = self.__dict__.setdefault(
+                        '_u1_unverified_tip_routes', set())
+                    if (route_key in unverified and
+                            hasattr(endpoint, 'prime_unknown_tip')):
+                        # Identified, not loaded by BMCU: the tip may stop
+                        # short of the nozzle (an interrupted load).
+                        endpoint.prime_unknown_tip(
+                            self._channel_metadata(device, channel).get(
+                                'material', ''))
+                    unverified.discard(route_key)
                     self._mark_u1_head_prepared(
                         endpoint.get('head_index', -1),
                         source='already-loaded BMCU route selected during print')
@@ -15704,6 +15887,8 @@ class BMCUManager(object):
             endpoint, target_device, target_channel)
         if verified_prestage is not None:
             allowed_uncertain.add(verified_prestage)
+        else:
+            self._settle_u1_routes_after_reconnect(endpoint)
         evidence = self._u1_require_consistent_route_ownership(
             endpoint.name, allowed_uncertain_routes=allowed_uncertain)
         if any(item['claimed'] for item in evidence):
@@ -15716,6 +15901,15 @@ class BMCUManager(object):
 
         owner = self._u1_owner_status(endpoint)
         owner_name = str(owner.get('owner', 'unknown') or 'unknown')
+        if owner_name == 'safety_hold':
+            # A BMCU disconnect set the hold. If it has reconnected and
+            # reported settled state since, reconcile now instead of refusing
+            # every Resume (F5).
+            self._refresh_u1_disconnect_hazards(endpoint.name)
+            if not self._u1_disconnect_hazards.get(endpoint.name):
+                self._reconcile_u1_leases(self.reactor.monotonic(), force=True)
+                owner = self._u1_owner_status(endpoint)
+                owner_name = str(owner.get('owner', 'unknown') or 'unknown')
         if owner_name in ('bmcu', 'bmcu_busy'):
             return False
         if owner_name not in ('native', 'native_busy'):
@@ -16050,6 +16244,8 @@ class BMCUManager(object):
     def cmd_TOOL_CHANGE(self, gcmd):
         self._require_standalone_operation('BMCU_TOOL_CHANGE', gcmd)
         tool = gcmd.get_int('TOOL', minval=0, maxval=255)
+        if self._print_state() in ('printing', 'paused', 'pause'):
+            self._restore_u1_print_after_restart()
         if self.print_plan_open:
             raise gcmd.error(
                 'BMCU print source plan is not committed; run '
@@ -16333,6 +16529,121 @@ class BMCUManager(object):
                               (head + 1, device.name, channel + 1))
         return device, channel
 
+    def _u1_device_fresh(self, device):
+        return bool(getattr(device, 'ready', False) and
+                    getattr(device, 'runtime_configured', False) and
+                    getattr(device, 'status_reconciled', False))
+
+    def _settle_u1_routes_after_reconnect(self, endpoint, gcmd=None):
+        """F8: after a BMCU disconnect or a power cut, the host's record of a
+        route and the BMCU can disagree. Trust the BMCU, cross-checked with the
+        Head's own sensor, instead of refusing every Resume:
+
+        * the record says loaded, the BMCU says EMPTY: the firmware finished
+          the pullback while the host was offline, so record EMPTY;
+        * the BMCU says UNCERTAIN and the Head sensor sees filament: the tip
+          is still in the Head, so identify it and record it LOADED;
+        * the BMCU says UNCERTAIN and the Head sensor is clear: nothing grips
+          the tip, so finish the pullback (the firmware stops at its own
+          sensor) and record EMPTY.
+        """
+        if (getattr(endpoint, 'driver', '') != 'snapmaker_u1' or
+                self._print_state() not in ('printing', 'paused', 'pause')):
+            return False
+        evidence = self._u1_endpoint_ownership_evidence(endpoint.name)
+        settled = False
+        for item in evidence:
+            device, channel = item['device'], int(item['channel'])
+            if item['mismatch'] and self._u1_device_fresh(device):
+                self._adopt_live_empty_u1_route(device, channel, endpoint)
+                settled = True
+        # UNCERTAIN on either side: the BMCU's own report, or the host's
+        # journal of an operation the power cut interrupted (the rebooted
+        # firmware forgets it and reports EMPTY while the tip is mid-path).
+        uncertain = [item for item in evidence
+                     if (item['raw_state'] == protocol.ROUTE_UNCERTAIN or
+                         item['route_key'] in self._uncertain_routes) and
+                     not item['inflight'] and
+                     self._u1_device_fresh(item['device'])]
+        if not uncertain:
+            return settled
+        try:
+            snapshot = endpoint.require_entry_sensor_snapshot(timeout=1.25)
+        except Exception as exc:
+            logging.info('BMCU could not read %s entry sensor to settle an '
+                         'UNCERTAIN route: %s', endpoint.name, exc)
+            return settled
+        in_head = snapshot.get('physical_detected')
+        head = int(endpoint.get('head_index', -1))
+        if in_head is True:
+            logging.info('BMCU %s: UNCERTAIN route with filament at the Head '
+                         'sensor; identifying it', endpoint.name)
+            self._identify_u1_head_filament(endpoint, head, gcmd)
+            return True
+        if in_head is False:
+            for item in uncertain:
+                self._finish_interrupted_u1_pullback(
+                    item['device'], int(item['channel']), endpoint, gcmd)
+            return True
+        return settled
+
+    def _adopt_live_empty_u1_route(self, device, channel, endpoint):
+        route_key = self._route_key(device, channel)
+        logging.warning(
+            'BMCU %s Channel %d: host record said loaded on %s but the '
+            'reconnected BMCU reports EMPTY; trusting the BMCU',
+            device.name, channel + 1, endpoint.name)
+        self._commit_u1_route_ownership(device, channel, protocol.ROUTE_EMPTY)
+        self._uncertain_routes.discard(route_key)
+        unloaded_tool = self.loaded_tools.pop(route_key, -1)
+        if self.active_tool == unloaded_tool:
+            self.active_tool = -1
+        self._unmark_print_route(device, channel)
+        try:
+            self._clear_u1_tail_detached(
+                endpoint, device, channel,
+                'reconnected BMCU reports the route EMPTY')
+        except Exception:
+            logging.exception('BMCU could not clear the %s tail journal',
+                              endpoint.name)
+        self._u1_lease_dirty = True
+        self._save_runtime()
+
+    def _finish_interrupted_u1_pullback(self, device, channel, endpoint, gcmd=None):
+        route_key = self._route_key(device, channel)
+        logging.info(
+            'BMCU %s Channel %d: finishing an interrupted pullback from %s '
+            '(Head sensor clear)', device.name, channel + 1, endpoint.name)
+        if gcmd is not None:
+            gcmd.respond_info(
+                'BMCU: finishing the interrupted pullback of %s Channel %d' %
+                (device.name, channel + 1))
+        self._lock(device, endpoint, 'FINISH INTERRUPTED PULLBACK',
+                   channel=channel)
+        try:
+            start_m = float(device.refresh()['meters'][channel])
+            self._set_phase(device, 'PULLBACK', channel=channel)
+            device.set_motion(channel, protocol.MOTION_PULL_BACK)
+            self._wait_pullback_safe(
+                device, channel, self.unload_timeout, start_m=start_m,
+                allow_transient_buffer_extremes=True)
+            device.mark_unloaded(channel)
+            device.refresh()
+            if self._route_state(device, channel) != protocol.ROUTE_EMPTY:
+                raise BMCUError(
+                    'PARK_FAILED: BMCU did not commit Channel %d as EMPTY after '
+                    'finishing the interrupted pullback' % (channel + 1))
+            self._commit_u1_route_ownership(device, channel, protocol.ROUTE_EMPTY)
+            self._uncertain_routes.discard(route_key)
+            unloaded_tool = self.loaded_tools.pop(route_key, -1)
+            if self.active_tool == unloaded_tool:
+                self.active_tool = -1
+            self._unmark_print_route(device, channel)
+            self._u1_lease_dirty = True
+            self._save_runtime()
+        finally:
+            self._unlock(device, endpoint)
+
     def _adopt_identified_u1_route(self, device, channel, endpoint, head):
         """Record an identified Channel as LOADED in its Head (the same commit as
         BMCU_ROUTE_CONFIRM STATE=LOADED, allowed at print start)."""
@@ -16358,6 +16669,9 @@ class BMCUManager(object):
                                 (device.name, channel + 1))
             self._commit_u1_route_ownership(device, channel, protocol.ROUTE_LOADED)
             self._uncertain_routes.discard(route_key)
+            # Its tip position is unknown until it is purged to the nozzle.
+            self.__dict__.setdefault(
+                '_u1_unverified_tip_routes', set()).add(route_key)
             self.device_status_changed(device, previous, current)
             tool = self._virtual_tool_for_source(device, channel)
             if tool >= 0:
@@ -16385,6 +16699,7 @@ class BMCUManager(object):
                 'Snapmaker endpoint for physical head %d is unavailable' % head)
 
         try:
+            self._restore_u1_print_after_restart()
             self._require_no_u1_cross_refill_pending()
             if (self.print_map_active and self._assigned_routes_for_endpoint(endpoint.name)
                     and self._u1_unaccounted_head_filament(endpoint)):
@@ -16662,11 +16977,18 @@ class BMCUManager(object):
             safe_reset_states = (
                 'standby', 'ready', 'idle', 'complete', 'completed',
                 'cancelled', 'canceled', 'error', 'failed')
+            stale_plan = bool(getattr(
+                self, '_print_session_from_previous_boot', False))
             if (self.print_map_active and
-                    print_state not in safe_reset_states):
+                    print_state not in safe_reset_states and not stale_plan):
                 raise gcmd.error(
                     'cannot replace the active BMCU print plan while printer state is %s' %
                     (print_state or 'unknown'))
+            if self.print_map_active and stale_plan:
+                logging.info('BMCU replacing the print plan restored from before '
+                             'the Klipper restart (job %s) with a new print',
+                             self.print_job_id or 'unknown')
+            self._print_session_from_previous_boot = False
             restore_required = bool(self._u1_original or
                 self._u1_map_backup or self._u1_used_backup or
                 self._u1_end_unload_backup)
@@ -19358,7 +19680,16 @@ class BMCUManager(object):
                             endpoint, 'manual %s route confirmation' % state,
                             close_generation=True)
                         self._clear_resolved_u1_startup_error()
-                    if not self.print_loaded_routes:
+                    if (not self.print_loaded_routes and
+                            getattr(self, '_print_session_from_previous_boot',
+                                    False) and self.print_map_active):
+                        # F12: a print cut by a power loss can still be
+                        # resumed with its saved plan; keep the session. A new
+                        # print replaces it (F11).
+                        self.print_terminal_unload_pending = False
+                        logging.info('BMCU keeping the print plan from before '
+                                     'the restart for a power-loss resume')
+                    elif not self.print_loaded_routes:
                         self.print_terminal_unload_pending = False
                         self._clear_print_session(
                             'all recorded routes manually confirmed empty')

@@ -345,6 +345,7 @@ class StockPrintTest(unittest.TestCase):
                  ('_u1_stock_feed_inner', True)]
         for attr, value in cases:
             self.setUp(); setattr(self.manager, attr, value)
+            self.manager._print_state = lambda: 'standby'   # not a resume
             self.manager._cmd_u1_stock_feed_wrapper(self.gcmd)
             self.manager._unload_locked.assert_not_called()
             self.original.assert_called_once()
@@ -901,6 +902,44 @@ class StockFeedFailureTest(unittest.TestCase):
         # A later, genuinely already-loaded head is reported as such again.
         self.m._u1_prepared_heads.clear()
         self.assertFalse(self.m._run_u1_stock_auto_feed(self.endpoint, 3, 'test'))
+
+
+class LinkLostHintTest(unittest.TestCase):
+    """F7: a lost BMCU link pauses with what to check."""
+    def test_offline_messages_say_what_to_do(self):
+        for raw in ('DEVICE_OFFLINE during feed operation',
+                    'bmcu0 serial port is not ready',
+                    'U1 control plane did not resume after printer motion'):
+            message = M._with_stock_feed_hint(raw)
+            self.assertIn("Check the BMCU's USB cable", message)
+            self.assertTrue(message.endswith('Then Resume'))
+            self.assertEqual(M._with_stock_feed_hint(message), message)
+
+
+class ResumeRouteTest(unittest.TestCase):
+    """F9: Resume looks ahead to the Head's next source, and stops at a stock one."""
+    def setUp(self):
+        self.m = manager_stub()
+        self.endpoint = types.SimpleNamespace(name='u1_head2')
+        self.bmcu = object()
+        self.m._loaded_devices_for_endpoint = lambda name: []
+        self.m._first_u1_route_for_endpoint = lambda name: None
+        self.m._resolve_tool = lambda tool: (self.bmcu, tool - 4, None)
+        here = {'endpoint': self.endpoint}
+        other = {'endpoint': types.SimpleNamespace(name='u1_head3')}
+        self.routes = {4: dict(here, kind='bmcu'), 5: dict(here, kind='bmcu'),
+                       6: dict(other, kind='bmcu'), 3: dict(here, kind='native')}
+        self.m._u1_logical_route = lambda tool: self.routes.get(tool)
+
+    def test_a_later_change_on_this_head_is_found(self):
+        self.m._u1_toolchange_plan = [{'tool': 4}, {'tool': 6}, {'tool': 5}]
+        self.m._u1_toolchange_cursor = 1
+        self.assertEqual(self.m._u1_resume_route(self.endpoint), (self.bmcu, 1))
+
+    def test_a_stock_source_next_leaves_the_resume_to_the_stock_feeder(self):
+        self.m._u1_toolchange_plan = [{'tool': 4}, {'tool': 3}, {'tool': 5}]
+        self.m._u1_toolchange_cursor = 1
+        self.assertIsNone(self.m._u1_resume_route(self.endpoint))
 
 
 if __name__ == '__main__':
