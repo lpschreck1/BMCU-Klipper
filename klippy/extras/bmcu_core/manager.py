@@ -21,7 +21,8 @@ from contextlib import contextmanager
 from . import compat, protocol, presets, transport
 from .release import PACKAGE_VERSION
 from .device import BMCUDevice
-from .endpoints import (SnapmakerU1Endpoint, create_endpoint, normalize_u1_material_name,
+from .endpoints import (EndpointError, SnapmakerU1Endpoint, create_endpoint,
+                        normalize_u1_material_name,
                         u1_tip_profile_defaults,
                         u1_tip_snapmaker_movement_defaults,
                         validate_u1_tip_profile)
@@ -10554,6 +10555,38 @@ class BMCUManager(object):
             self._cancel_u1_background_jobs(
                 'print ended before the prepared source was consumed', wait=True)
 
+    def _u1_wait_parked_or_foreground_selected(self, endpoint, timeout,
+                                              background_job=None):
+        """Wait until the Head is safe for a parked prestage (returns False), or
+        until the foreground has selected it for this job's own target (True)."""
+        foreground = bool(
+            isinstance(background_job, dict) and
+            background_job.get('foreground_target_requested') and
+            callable(getattr(endpoint, 'prepare_selected_prestage', None)))
+        if not foreground:
+            endpoint.wait_prestage_safe(timeout)
+            return False
+        deadline = self.reactor.monotonic() + max(0.0, float(timeout))
+        last_error = None
+        while True:
+            try:
+                endpoint.verify_prestage_safe()
+                return False
+            except EndpointError as exc:
+                last_error = exc
+            try:
+                endpoint.verify_selected()
+                return True
+            except Exception:
+                pass
+            now = self.reactor.monotonic()
+            if now >= deadline:
+                raise EndpointError(
+                    'Snapmaker head %d did not become safe for background '
+                    'prestage: %s' % (int(endpoint.get('head_index', -1)),
+                                      last_error))
+            self.reactor.pause(min(deadline, now + 0.05))
+
     def _prestage_u1_to_entry_locked(self, device, channel, endpoint, tool,
                                      cancel_check=None,
                                      allowed_detached_source=None,
@@ -10617,8 +10650,19 @@ class BMCUManager(object):
         else:
             park_timeout = float(endpoint.get(
                 'u1_prestage_park_timeout', 20.0) or 20.0)
-            endpoint.wait_prestage_safe(park_timeout)
-            endpoint.prepare_prestage()
+            if self._u1_wait_parked_or_foreground_selected(
+                    endpoint, park_timeout, background_job):
+                # The foreground picked this Head for this same target while
+                # the job waited for PARKED: continue as a selected-Head arrival
+                # instead of failing the print.
+                target_selected = True
+                logging.info(
+                    'BMCU %s was selected by the foreground for T%d while '
+                    'background prestage waited for PARKED; continuing as a '
+                    'selected-Head arrival', endpoint.name, tool)
+                endpoint.prepare_selected_prestage()
+            else:
+                endpoint.prepare_prestage()
         if self._u1_has_authoritative_entry_sensor(endpoint):
 
             endpoint.require_entry_sensor_snapshot(timeout=1.25)

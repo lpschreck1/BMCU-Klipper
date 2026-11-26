@@ -256,7 +256,20 @@ class World(object):
         source = self.sources[source] if isinstance(source, str) else source
         source.stalled = False
         source.stall_reason = ''
-        moved = self._apply(source, float(mm))
+        mm = float(mm)
+        # MODEL: a source's own wheel cannot push its tip through the head's extruder
+        # gears; only the gears turning (gear_move) carry it on to the nozzle. Without
+        # this, a background SEND_OUT to a parked head pushed the tip to the nozzle.
+        if source.tip is not None and mm > 0:
+            room = max(0.0, source.gears_p - source.tip)
+            if mm > room:
+                moved = self._apply(source, room) if room > 0 else 0.0
+                source.stalled = True
+                source.stall_reason = 'gears'
+                if moved > 0:
+                    source.pushed_mm += moved
+                return moved
+        moved = self._apply(source, mm)
         if moved > 0:
             source.pushed_mm += moved
         return moved

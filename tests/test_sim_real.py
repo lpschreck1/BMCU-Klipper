@@ -14,6 +14,7 @@ import os
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 import _support  # noqa: F401
 from bmcu_core import gcode_plan
@@ -247,6 +248,40 @@ class Incident5Test(unittest.TestCase):
         message = sim.print_stats.message
         self.assertRegex(message, r'(?i)head 4')
         self.assertRegex(message, r'(?i)clog|jam|clear|nozzle')
+
+
+class ForegroundSelectedPrestageTest(unittest.TestCase):
+    """F14, found on the user's mixed six-band test print: Head 3 swapped T4 for T5
+    in the background while Head 2 printed a short stock T1 section. The foreground
+    then selected Head 3 for that same T5 while the background job still waited for
+    it to be PARKED, and the print paused ("Snapmaker head 2 is not PARKED; prestage
+    is blocked") with no fault at all."""
+
+    def path(self):
+        path = os.path.join(FIXTURES, 'bmcu_test_print.gcode')
+        if not os.path.exists(path):
+            self.skipTest('tests/sim/fixtures/real/bmcu_test_print.gcode not supplied')
+        return path
+
+    def test_the_print_completes_without_a_pause(self):
+        sim = run_file(self, self.path())
+        sim.start()
+        self.assertEqual(sim.run_until_stopped(), 'complete', sim.print_stats.message)
+        self.assertEqual(checks.verify(sim), [])
+
+    def test_negative_control_the_old_wait_pauses(self):
+        from bmcu_core import manager as M
+
+        def old_wait(self, endpoint, timeout, background_job=None):
+            endpoint.wait_prestage_safe(timeout)
+            return False
+        with mock.patch.object(M.BMCUManager, '_u1_wait_parked_or_foreground_selected',
+                               old_wait):
+            sim = run_file(self, self.path())
+            sim.start()
+            state = sim.run_until_stopped()
+        self.assertEqual(state, 'paused')
+        self.assertIn('is not PARKED; prestage is blocked', sim.print_stats.message)
 
 
 if __name__ == '__main__':

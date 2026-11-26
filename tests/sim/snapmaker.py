@@ -300,6 +300,8 @@ class GcodeMove(object):
         else:
             sim.reactor.pause(sim.reactor.monotonic() + 0.05)
 
+    BODY_RETRACT_CREDIT_MAX_MM = 12.0
+
     def extrude(self, delta, body=False):
         sim = self.sim
         extruder = sim.toolhead.get_extruder()
@@ -310,6 +312,14 @@ class GcodeMove(object):
         remaining = abs(delta)
         sign = 1.0 if delta >= 0 else -1.0
         printing = body and sim.print_stats.state == 'printing' and delta > 0
+        if body and sim.print_stats.state == 'printing' and delta < 0:
+            # MODEL: the print's own retraction (G1 E-0.8 before a travel, E-10 at a
+            # tool change). The un-retract that follows refills the nozzle rather than
+            # printing, so it is not dry printing. Capped, so a load that stopped short
+            # of the nozzle still shows.
+            extruder.body_retract_credit = min(
+                self.BODY_RETRACT_CREDIT_MAX_MM,
+                getattr(extruder, 'body_retract_credit', 0.0) + abs(delta))
         while remaining > 1e-9:
             step = min(5.0, remaining)
             try:
@@ -317,8 +327,12 @@ class GcodeMove(object):
             except W.WorldError:
                 raise K.CommandError('Extrude below minimum temp')
             if printing:
+                credit = min(max(step - flow, 0.0),
+                             getattr(extruder, 'body_retract_credit', 0.0))
+                if credit:
+                    extruder.body_retract_credit -= credit
                 extruder.print_commanded += step
-                extruder.print_flow += flow
+                extruder.print_flow += flow + credit
             extruder.total_e += step
             sim.reactor.pause(sim.reactor.monotonic() + step / max(self.speed, 0.1))
             remaining -= step

@@ -5,14 +5,16 @@ Trimmed Orca exports (`python tests/sim/trim_gcode.py IN OUT`, below about 1 MB 
 power-loss subsets. A file placed here with a `.gcode` extension is picked up automatically;
 the tests skip when none is present.
 
-Still wanted from the user (none is checked in yet):
+Supplied by the user on 2026-11-26 (OrcaSlicer with the BMCU-Klipper Tool Assignment plugin, Snapmaker U1):
 
-| File | Where it comes from | What it exercises |
-|---|---|---|
-| `baby_yoda*.gcode` | `baby_yoda_christmas_xmas_PLA_155.3g_8h49m.gcode` | The 2026-11-25 incident: T4 on head 2 and a stock load on head 4 at print start, many tool changes. `test_incident_5_on_the_baby_yoda_fixture`. |
-| `stock_only*.gcode` | any print that uses only the stock feeders | No BMCU command in the file; BMCU must stay out of the way. |
-| `bmcu_only*.gcode` | any print that uses only BMCU channels | Every tool change and load is BMCU's. |
-| `bmcu_test_print*.gcode` | the post-install `BMCU-test-print` (six bands) | The print the install guide asks the user to run first. |
+| File | Original | Lines | Trimmed with | What it exercises |
+|---|---|---|---|---|
+| `baby_yoda.gcode` | `baby_yoda_christmas_xmas_PLA_155.3g_8h49m.gcode`, 1,700,936 lines | 53,654 | `--lean --every 5000` | The 2026-11-25 incident: stock T0/T1/T3 and BMCU T4, 874 tool changes. `Incident5Test.test_on_the_baby_yoda_fixture`. |
+| `bmcu_only.gcode` | `band_4_PLA_11.9g_37m10s.gcode` (the six-band test print, every band on BMCU) | 35,413 | not trimmed | BMCU T4–T7 only, 76 changes, fast same-Head swaps on Heads 3 and 4. |
+| `bmcu_test_print.gcode` | `band_6_PLA_11.9g_37m10s.gcode` (the six-band test print, mixed) | 35,471 | not trimmed | Stock T0/T1 and BMCU T4–T7, 76 changes. Found F14. |
+| `stock_only.gcode` | `Small_PLA_4h8m.gcode` | 43,628 | not trimmed | Stock T0/T2 only, no BMCU commands. BMCU must stay out of the way. |
+
+Both band files have 75 filament changes, not 5: the six parts were sliced side by side, not as one stacked object.
 
 Record here, for each file added: where it came from (slicer, profile, date), the size before
 and after trimming, and the trimmer options used.

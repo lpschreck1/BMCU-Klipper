@@ -27,7 +27,9 @@ NOOP_COMMANDS = (
     'BED_MESH_CALIBRATE', 'PRINT_END', 'M141', 'M190', 'M140', 'M107', 'M106',
     'SM_PRINT_FLOW_CALIBRATE', 'G29', 'M73', 'SET_VELOCITY_LIMIT', 'M201', 'M203',
     'M205', 'M204', 'M220', 'M221', 'EXCLUDE_OBJECT_DEFINE', 'M117', 'M486',
-    'SET_PRINT_STATS_INFO', 'SET_FAN_SPEED', 'FILAMENT_DT_CLEAR', 'M84', 'MOVE_EXTRUDE')
+    'SET_PRINT_STATS_INFO', 'SET_FAN_SPEED', 'FILAMENT_DT_CLEAR', 'M84', 'MOVE_EXTRUDE',
+    # in real Orca exports (tests/sim/fixtures/real), none of them moving filament
+    'G21', 'SET_PRESSURE_ADVANCE', 'EXCLUDE_OBJECT_START', 'EXCLUDE_OBJECT_END')
 
 
 def _sync_write_file(reactor, path, data, safe_write=True, timeout=10.0):
@@ -292,6 +294,10 @@ class Sim(object):
             text = stream.read()
         tools = self.tools_in(text)
         self.sdcard.load(path, text)
+        # about 2.5 simulated minutes per tool change (874 in the Baby Yoda print)
+        changes = sum(1 for line in text.split(chr(10))
+                      if line.upper().startswith('BMCU_TOOL_CHANGE'))
+        self.run_limit = max(7200.0, 150.0 * changes)
         cfg = self.print_task_config.print_task_config
         for tool in tools:
             if tool < 4:
@@ -334,9 +340,16 @@ class Sim(object):
     def start_print(self):
         self.run_gcode('SDCARD_PRINT_FILE')
 
-    def run_until_stopped(self, limit=7200.0):
+    # Simulated seconds a print may run before run_until_stopped gives up. A real file
+    # with hundreds of tool changes needs far more than the synthetic prints (slice_file
+    # raises it from the file's own tool-change count).
+    run_limit = 7200.0
+
+    def run_until_stopped(self, limit=None):
         """Advance until the print completes, pauses or fails. Returns the state, or
         ``'restarted'`` if the machine was restarted on the way (see ``restart``)."""
+        if limit is None:
+            limit = self.run_limit
         try:
             end = self.reactor.monotonic() + limit
             while self.reactor.monotonic() < end:
@@ -582,7 +595,7 @@ class User(object):
     def __init__(self, sim):
         self.sim = sim
 
-    def resume(self, limit=7200.0):
+    def resume(self, limit=None):
         """Press Resume. Returns the state the print reaches next."""
         sim = self.sim
         before = len(sim.restarts)

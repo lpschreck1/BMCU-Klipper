@@ -9,6 +9,29 @@ import re
 from . import world as W
 
 
+
+def _split_gcode_params(eargs):
+    """Snapmaker Klipper's KEY=VALUE splitter (klippy/gcode.py)."""
+    result, current = [], []
+    in_quote, quote_char = False, None
+    for ch in eargs:
+        if in_quote:
+            if ch == quote_char:
+                in_quote = False
+            else:
+                current.append(ch)
+        elif ch in ('"', "'"):
+            in_quote, quote_char = True, ch
+        elif ch in (' ', '\t'):
+            if current:
+                result.append(''.join(current))
+                current = []
+        else:
+            current.append(ch)
+    if current:
+        result.append(''.join(current))
+    return result
+
 class CommandError(Exception):
     """Klipper's CommandError, with Snapmaker's coded-exception fields."""
 
@@ -157,7 +180,9 @@ class FakeGcode(object):
         params = {}
         if any('=' in part for part in parts[1:]) or (
                 len(command) > 1 and command[0] not in 'GMT'):
-            for part in parts[1:]:
+            # Snapmaker's klippy/gcode.py _split_gcode_params: quotes are removed
+            # and spaces inside them kept (EXPECT_MATERIAL="PLA" reads PLA).
+            for part in _split_gcode_params(line[len(parts[0]):].strip()):
                 if '=' in part:
                     key, value = part.split('=', 1)
                     params[key.upper()] = value
