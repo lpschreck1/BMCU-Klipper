@@ -2183,6 +2183,71 @@ class BMCUManager(object):
             self._critical_motion_active or
             self._critical_motion_depth)
 
+    U1_COIL_ASSIST_MM = 25.0          # BMCU push past its pressure target
+    U1_COIL_ASSIST_CONTACT_PCT = 95   # stop once the buffer is this compressed
+    U1_COIL_ASSIST_HEAD_MM = 25.0     # Head extruder turns meanwhile, to grip
+    U1_COIL_ASSIST_HEAD_SPEED = 180.0  # mm/min
+
+    def _u1_coil_assist_push(self, device, channel, endpoint, material, exc):
+        """One automatic retry when the BEFORE_ON_USE coil check sees nothing.
+
+        2026-11-26 on the printer: bmcu0 Channel 2 stopped just short of Head 3's
+        gears three times. The firmware's pressure hold squeezed the buffer to its
+        target (81 of 82 %) and stopped pushing; the filament didn't move until the
+        user pushed by hand. Here BMCU makes one measured push past that target
+        (FEED_DISTANCE, stopping at 95 % buffer) while the Head extruder turns
+        slowly, then the coil is checked again. If that fails too, the original
+        error stands and the print pauses as before."""
+        if (getattr(endpoint, 'driver', '') != 'snapmaker_u1' or
+                'U1_TOOLHEAD_NOT_LOADED' not in str(exc)):
+            raise exc
+        config = getattr(endpoint, 'config', {}) or {}
+        baseline = config.get('_u1_last_coil_baseline')
+        threshold = config.get('_u1_last_coil_threshold')
+        if baseline is None or threshold is None:
+            raise exc
+        logging.info(
+            'BMCU %s Channel %d did not reach the %s gears; pushing %.0f mm past '
+            'the pressure target while the Head turns, then checking again',
+            device.name, channel + 1, endpoint.name, self.U1_COIL_ASSIST_MM)
+        try:
+            device.set_motion(channel, protocol.MOTION_IDLE)
+            before = float(device.status['meters'][channel])
+            op_id = device.start_feed_distance(
+                channel, self.U1_COIL_ASSIST_MM, self.U1_COIL_ASSIST_CONTACT_PCT,
+                int((self.U1_COIL_ASSIST_HEAD_MM /
+                     self.U1_COIL_ASSIST_HEAD_SPEED) * 60000.0) + 10000)
+            endpoint.extrude(self.U1_COIL_ASSIST_HEAD_MM,
+                             self.U1_COIL_ASSIST_HEAD_SPEED)
+            result = self._wait_feed_operation(device, op_id, 15.0, endpoint)
+            device.refresh()
+            pushed = (float(device.status['meters'][channel]) - before) * 1000.0
+            # then the normal BEFORE_ON_USE run to the coil, with the pressure hold
+            device.set_motion(channel, protocol.MOTION_BEFORE_ON_USE)
+            remaining = float(config.get('_u1_last_nozzle_search_mm') or 34.0)
+            endpoint.extrude(max(5.0, min(remaining, 70.0)), 360.0)
+            evidence = endpoint.verify_loaded_after_pause(
+                material, baseline=baseline, threshold=threshold)
+        except Exception as assist_exc:
+            logging.info('BMCU %s Channel %d assist push did not load it: %s',
+                         device.name, channel + 1, assist_exc)
+            try:
+                device.set_motion(channel, protocol.MOTION_IDLE)
+            except Exception:
+                pass
+            raise EndpointError(
+                '%s BMCU also pushed %.0f mm past its pressure target, without '
+                'success: push %s Channel %d down by hand until the Head grips it, '
+                'then Resume' % (str(exc), self.U1_COIL_ASSIST_MM, device.name,
+                                 channel + 1))
+        logging.info(
+            'BMCU %s Channel %d loaded after the assist push (%.1f mm, %s)',
+            device.name, channel + 1, pushed,
+            (result or {}).get('reason', 'done'))
+        evidence = dict(evidence or {})
+        evidence['assist_push_mm'] = pushed
+        return evidence
+
     def _wait_critical_motion_released(self, timeout=None):
         """Wait out the release delay after homing or probing has ended.
 
@@ -13451,8 +13516,12 @@ class BMCUManager(object):
             phase = ('BEFORE_ON_USE'
                      if endpoint.driver == 'snapmaker_u1' else 'TOOLHEAD_PREPARATION')
             self._set_phase(device, phase, channel=channel)
-            load_ready_evidence = self._endpoint_temperature_call(
-                endpoint, 'load_ready', material, load_temperature_profile)
+            try:
+                load_ready_evidence = self._endpoint_temperature_call(
+                    endpoint, 'load_ready', material, load_temperature_profile)
+            except EndpointError as exc:
+                load_ready_evidence = self._u1_coil_assist_push(
+                    device, channel, endpoint, material, exc)
             if self.debug_enabled and endpoint.driver == 'snapmaker_u1':
                 self._debug_log(
                     'U1 %s BEFORE_ON_USE passive evidence accepted: %s',

@@ -414,9 +414,14 @@ class FakeFirmware(object):
 
     def step(self, dt):
         for ch in range(4):
-            self.source(ch).assisting = (
-                self.motion[ch] in (P.MOTION_SEND_OUT, P.MOTION_BEFORE_ON_USE,
-                                    P.MOTION_ON_USE) or
+            source = self.source(ch)
+            # MODEL (WeakPressure): a path with more drag holds the tip short of the
+            # gears against the BEFORE_ON_USE pressure hold; a feed op pushes harder
+            held = (self.motion[ch] == P.MOTION_BEFORE_ON_USE and
+                    getattr(source, 'weak_pressure', False))
+            source.assisting = (
+                (self.motion[ch] in (P.MOTION_SEND_OUT, P.MOTION_BEFORE_ON_USE,
+                                     P.MOTION_ON_USE) and not held) or
                 (self.op is not None and self.op.channel == ch and
                  self.op.type != P.OP_CHANNEL_RETRACT))
         op = self.op

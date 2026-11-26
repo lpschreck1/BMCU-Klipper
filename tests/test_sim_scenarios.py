@@ -14,7 +14,7 @@ from unittest import mock
 import _support  # noqa: F401
 from bmcu_core import endpoints as E
 from bmcu_core import manager as M
-from sim import faults as F
+from sim import checks, faults as F
 from sim.klipper import CommandError
 from sim.runner import Sim
 
@@ -394,6 +394,52 @@ class Incident9UnrecordedFilamentTest(unittest.TestCase):
         sim.inject(F.GcodeLine('PRINT_START'), F.Unrecorded('bmcu0'))
         sim.run_print()
         self.assertTrue(any('checking which Channel it is' in l for l in sim.gcode.output))
+
+
+class WeakPressureAssistTest(unittest.TestCase):
+    """2026-11-26 on the printer: bmcu0 Channel 2 stopped short of Head 3's gears
+    three times (coil path_delta 28, 14), the pressure hold at its buffer target and
+    not pushing. The user pushed by hand and it loaded. BMCU now makes that push
+    itself, once, before it pauses."""
+
+    def sim(self):
+        sim = make_sim(self, plan=[[0], [4], [5], [3]],
+                       spools={0: 'PLA grey', 4: 'PLA red', 5: 'PLA blue', 3: 'PLA white'})
+        sim.inject(F.GcodeLine('PRINT_START'), F.WeakPressure('bmcu1'))
+        return sim
+
+    def test_the_assist_push_loads_it_without_a_pause(self):
+        sim = self.sim()
+        real = M.BMCUManager._u1_coil_assist_push
+        calls = []
+        def spy(self, *args):
+            calls.append(args[1])
+            return real(self, *args)
+        with mock.patch.object(M.BMCUManager, '_u1_coil_assist_push', spy):
+            self.assertEqual(sim.run_print(), 'complete', sim.print_stats.message)
+        self.assertEqual(calls, [1])            # bmcu0 Channel 2, once
+        self.assertEqual(sim.tool_changes, sim.planned_tool_changes())
+        self.assertEqual(sim.world.consistent(), [])
+
+    def test_without_the_assist_it_pauses(self):
+        sim = self.sim()
+        def no_assist(self, device, channel, endpoint, material, exc):
+            raise exc
+        with mock.patch.object(M.BMCUManager, '_u1_coil_assist_push', no_assist):
+            sim.start()
+            state = sim.run_until_stopped()
+        self.assertEqual(state, 'paused')
+        self.assertIn('U1_TOOLHEAD_NOT_LOADED', sim.print_stats.message)
+
+    def test_a_clog_still_pauses_and_says_to_push_by_hand(self):
+        sim = make_sim(self, plan=[[0], [4], [5], [3]],
+                       spools={0: 'PLA grey', 4: 'PLA red', 5: 'PLA blue', 3: 'PLA white'})
+        sim.inject(F.GcodeLine('PRINT_START'), F.Clog(2))
+        sim.start()
+        self.assertEqual(sim.run_until_stopped(), 'paused')
+        self.assertIn('without success: push bmcu0 Channel', sim.print_stats.message)
+        out = checks.recover(sim, ('clear_fault',), start=False)
+        self.assertEqual(out.state, 'complete', out.messages)
 
 
 class BufferSlackIdentifyTest(unittest.TestCase):

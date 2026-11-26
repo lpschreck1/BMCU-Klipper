@@ -403,6 +403,22 @@ class Unrecorded(Fault):
         sim.world.pull(source, source.tip or 0.0)
 
 
+class WeakPressure(Fault):
+    """2026-11-26, bmcu0 Channel 2 into Head 3: the BEFORE_ON_USE pressure hold
+    squeezed the buffer to its target and stopped, with the tip short of the gears.
+    A harder push (a feed op, or the user's hand) got it in."""
+    name = 'weak_pressure'
+
+    def __init__(self, source):
+        self.source = source
+
+    def apply(self, sim):
+        sim.world.sources[self.source].weak_pressure = True
+
+    def clear(self, sim):
+        sim.world.sources[self.source].weak_pressure = False
+
+
 class BufferSlack(Fault):
     """The channel's buffer is compressed (seen at 82 % after a load on the real
     printer, 2026-11-26): the next ``mm`` the head pulls come out of the buffer and
