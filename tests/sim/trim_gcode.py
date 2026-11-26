@@ -19,6 +19,7 @@ kept moves already carry the cumulative E. XY positions of thinned moves are not
 The whole file is read into memory (a 60 MB export needs a few hundred MB).
 """
 import argparse
+import os
 import re
 import sys
 
@@ -30,6 +31,10 @@ IMPORTANT = re.compile(
     r'PRINT_START|PRINT_END|G28\b|CLEAR_PAUSE|RESUME\b)', re.I)
 LAYER_MARK = re.compile(r'^;\s*(LAYER_CHANGE|Z:|HEIGHT:|layer num|CHANGE_LAYER|'
                         r'Change Tool|EXECUTABLE_BLOCK|HEADER_BLOCK|CONFIG_BLOCK)', re.I)
+# Commands BMCU and Snapmaker never react to; --lean drops them (a long print has one or
+# more per feature, which is most of what is left once the moves are thinned).
+NOISE = re.compile(r'^(M73|M204|M205|M117|M486|SET_VELOCITY_LIMIT|'
+                   r'EXCLUDE_OBJECT_START|EXCLUDE_OBJECT_END)\b', re.I)
 HEADER_COMMENT = re.compile(r'^;\s*(total|filament used|estimated|max_layer_z|'
                             r'nozzle_temperature|filament_type)', re.I)
 
@@ -47,7 +52,7 @@ def _set_e(line, value):
     return E_WORD.sub('E%.5f' % value, line, count=1)
 
 
-def trim_lines(lines, every=12, edge=6, context=30):
+def trim_lines(lines, every=12, edge=6, context=30, lean=False):
     """The trimmed list of lines (each without its newline)."""
     count = len(lines)
     keep = [False] * count
@@ -75,6 +80,8 @@ def trim_lines(lines, every=12, edge=6, context=30):
                 keep[index] = True
             continue
         if not _is_move(line):
+            if lean and NOISE.match(line) and not (in_header or in_config):
+                continue
             keep[index] = True                       # every command that is not a move
     end_start = count
     for index, raw in enumerate(lines):              # context around the important lines
@@ -87,9 +94,13 @@ def trim_lines(lines, every=12, edge=6, context=30):
                 end_start = min(end_start, index)
         if important:
             for near in range(max(0, index - context), min(count, index + context + 1)):
+                if lean and NOISE.match(lines[near].strip()):
+                    continue
                 keep[near] = True
     for index in range(count):                       # the start and the end G-code in full
         if (first_layer is not None and index < first_layer) or index >= end_start:
+            if lean and NOISE.match(lines[index].strip()):
+                continue
             keep[index] = True
     # thin the moves layer by layer, carrying the E of the dropped ones
     relative = True
@@ -181,14 +192,25 @@ def main(argv=None):
     parser.add_argument('output')
     parser.add_argument('--every', type=int, default=12)
     parser.add_argument('--edge', type=int, default=6)
-    parser.add_argument('--context', type=int, default=30)
+    parser.add_argument('--context', type=int, default=None,
+                        help='lines kept around each tool change, temperature, BMCU '
+                             'command and layer change (default 30, or 3 with --lean)')
+    parser.add_argument('--lean', action='store_true',
+                        help='for long prints: drop commands BMCU and Snapmaker never '
+                             'react to (M73, M204, SET_VELOCITY_LIMIT, ...), keep less '
+                             'context, and keep fewer moves per layer')
     args = parser.parse_args(argv)
+    context = args.context if args.context is not None else (3 if args.lean else 30)
+    edge = min(args.edge, 2) if args.lean else args.edge
     with open(args.input, encoding='utf-8', errors='replace', newline='') as stream:
         lines = [line.rstrip('\r\n') for line in stream]
-    trimmed = trim_lines(lines, args.every, args.edge, args.context)
+    trimmed = trim_lines(lines, args.every, edge, context, lean=args.lean)
     with open(args.output, 'w', encoding='utf-8', newline='\n') as stream:
         stream.write('\n'.join(trimmed) + '\n')
-    sys.stderr.write('%d -> %d lines\n' % (len(lines), len(trimmed)))
+    size = os.path.getsize(args.output)
+    sys.stderr.write('%d -> %d lines, %.2f MB\n' % (len(lines), len(trimmed), size / 1e6))
+    if size > 1.2e6:
+        sys.stderr.write('Still over 1 MB: try --lean, then a larger --every.\n')
     return 0
 
 

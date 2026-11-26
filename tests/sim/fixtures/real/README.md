@@ -17,5 +17,7 @@ Still wanted from the user (none is checked in yet):
 Record here, for each file added: where it came from (slicer, profile, date), the size before
 and after trimming, and the trimmer options used.
 
+For a long print (many hours), add `--lean`, then raise `--every` if it is still over 1 MB.
+
 `tests/sim/fixtures/real/original/` is git-ignored: put the untrimmed exports there to run
 `test_trimmed_file_plans_the_same_tool_changes` against them.
