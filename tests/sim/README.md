@@ -81,6 +81,22 @@ fans, pressure advance, purifier, exclude-object state, flow/speed factors, time
 defect detection; the MCU "valid line" is exactly the line being executed (the real one lags a
 few moves); and the moves' E position is not restored.
 
+## Real sliced files (M10)
+
+`python tests/sim/trim_gcode.py IN.gcode OUT.gcode` shrinks an Orca export below about 1 MB
+and keeps what BMCU and Snapmaker react to (header and config blocks, start and end G-code,
+every non-move command, 30 lines around tool changes / `BMCU_*` / `SET_PRINT_*` / temperatures
+/ layer changes) and each layer's net extrusion. `Sim.slice_file(path)` loads a real file in
+place of `gcode_gen`; trimmed files in `fixtures/real/` run end to end and through a cable
+glitch and a power cut (`test_sim_real.py`). To check any print before starting it:
+
+```sh
+BMCU_SIM_GCODE=/path/to/file.gcode python -m unittest tests.test_sim_real
+```
+
+`BMCU_SIM_FULL=1` adds more phases to the M8 disconnect sweep (the default set is what
+`SWEEP.md` records). The default suite takes about 40 s.
+
 ## Seams in production code
 
 **None.** `device.py`, `manager.py` and `transport.py` are driven from outside by replacing

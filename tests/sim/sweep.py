@@ -104,7 +104,20 @@ SPOOLS2 = {0: 'PLA grey', 4: 'PLA red', 5: 'PLA blue', 6: 'PLA black'}
 FULL = bool(os.environ.get('BMCU_SIM_FULL'))
 
 
-def run_spec(trigger, fault, actions=('clear_fault',), plan=None, spools=None, hook=None):
+def _load_print(sim, plan, spools, path):
+    """The synthetic print (``plan``) or a real file (``path``) with its spools."""
+    if path is None:
+        sim.load_spools(spools or SPOOLS2)
+        sim.slice(plan or PLAN2)
+        return
+    with open(path, encoding='utf-8', errors='replace') as stream:
+        text = stream.read()
+    sim.load_spools(Sim.spools_for_file(text, sim.tools_in(text)))
+    sim.slice_file(path)
+
+
+def run_spec(trigger, fault, actions=('clear_fault',), plan=None, spools=None, hook=None,
+             path=None):
     """One case: the reference print, ``fault`` armed at ``trigger``, then the user's
     ``actions`` before each Resume. Returns ``(kind, detail)`` where ``kind`` is
     ``no_effect``, ``resumed``, ``stuck`` or ``dirty`` (finished, but a post-check failed)."""
@@ -112,8 +125,7 @@ def run_spec(trigger, fault, actions=('clear_fault',), plan=None, spools=None, h
     try:
         sim.boot(15.0)
         sim.setup_u1()
-        sim.load_spools(spools or SPOOLS2)
-        sim.slice(plan or PLAN2)
+        _load_print(sim, plan, spools, path)
         if trigger is not None:
             sim.inject(trigger, fault)
         if hook is not None:
@@ -144,6 +156,13 @@ def _disconnect_cases():
         ('BEFORE_ON_USE', lambda: F.BeforeOnUse(2)),
         ('prestaging T5', lambda: F.Prestaging(5)),
     ]
+    if FULL:        # BMCU_SIM_FULL=1: more phases (SWEEP.md only records the default set)
+        points += [
+            ('load 1000 mm', lambda: F.BmcuMoving('bmcu0', 'load', 1000)),
+            ('unload 500 mm', lambda: F.BmcuMoving('bmcu0', 'unload', 500)),
+            ('BEFORE_ON_USE head 4', lambda: F.BeforeOnUse(3)),
+            ('load T6 50 mm', lambda: F.BmcuMoving('bmcu2', 'load', 50)),
+        ]
     durations = [('3 s', 3.0), ('30 s', 30.0), ('until replug', None)]
     cases = []
     for point, trig in points:
@@ -185,7 +204,8 @@ def _helper_cases():
     return cases
 
 
-def run_restart_case(kind, trigger, plan=None, spools=None, hook=None, corrupt=None):
+def run_restart_case(kind, trigger, plan=None, spools=None, hook=None, corrupt=None,
+                     path=None):
     """One restart case: ``kind`` ('klipper' or 'power') at ``trigger``; the user then starts
     the print again (klipper) or taps power-loss resume (power). Returns ``(outcome, detail)``
     with the same outcomes as ``run_spec``; ``dirty`` also covers BMCU believing something
@@ -194,8 +214,7 @@ def run_restart_case(kind, trigger, plan=None, spools=None, hook=None, corrupt=N
     try:
         sim.boot(15.0)
         sim.setup_u1()
-        sim.load_spools(spools or SPOOLS2)
-        sim.slice(plan or PLAN2)
+        _load_print(sim, plan, spools, path)
         if hook is not None:
             hook(sim)
         sim.restart(kind, at=trigger, corrupt_state=corrupt)

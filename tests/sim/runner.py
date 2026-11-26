@@ -6,6 +6,7 @@ Snapmaker modules and (optionally) the real ``BMCUManager`` wired to a fake BMCU
 import copy
 import gc
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -269,7 +270,51 @@ class Sim(object):
                 cfg['reprint_info']['extruders_used'][tool] = True
         self.gcode_text = text
         self.print_tools = tools
+        self.print_path = path
         return path
+
+    FILE_TOOL = re.compile(r'^(?:T(\d+)|BMCU_TOOL_CHANGE\s+TOOL=(\d+)|BMCU_PRINT_MAP\s+TOOL=(\d+))',
+                           re.I)
+
+    def tools_in(self, text):
+        """The logical tools a G-code file uses (T<n>, BMCU_TOOL_CHANGE, BMCU_PRINT_MAP)."""
+        found = set()
+        for line in text.split(chr(10)):
+            match = self.FILE_TOOL.match(line.strip())
+            if match:
+                found.add(int([g for g in match.groups() if g is not None][0]))
+        return sorted(found)
+
+    def slice_file(self, path):
+        """Load a real sliced file in place of ``gcode_gen``. Returns the tools it uses;
+        ``spools_for_file`` says what to put on them."""
+        with open(path, encoding='utf-8', errors='replace') as stream:
+            text = stream.read()
+        tools = self.tools_in(text)
+        self.sdcard.load(path, text)
+        cfg = self.print_task_config.print_task_config
+        for tool in tools:
+            if tool < 4:
+                cfg['extruders_used'][tool] = True
+                cfg['reprint_info']['extruders_used'][tool] = True
+        self.gcode_text = text
+        self.print_tools = tools
+        self.print_path = path
+        return tools
+
+    @staticmethod
+    def spools_for_file(text, tools):
+        """``{tool: 'MATERIAL colour'}`` from the file's ``filament_type`` / ``filament_colour``
+        config lines (PLA white if absent)."""
+        def listed(key):
+            match = re.search(r'^;\s*%s\s*=\s*(.*)$' % key, text, re.M)
+            return [v.strip() for v in match.group(1).split(';')] if match else []
+        materials = listed('filament_type')
+        spools = {}
+        for tool in tools:
+            material = materials[tool] if tool < len(materials) and materials[tool] else 'PLA'
+            spools[tool] = '%s white' % material.replace(' ', '')
+        return spools
 
     def slice_stock(self, plan, **kwargs):
         """A print sliced with Snapmaker's own profile (no BMCU commands)."""
@@ -501,7 +546,7 @@ class Sim(object):
 
     def reload_print(self):
         """The user selects the same file again (after a Klipper restart)."""
-        self.sdcard.load(os.path.join(self.tmp, 'print.gcode'), self.gcode_text)
+        self.sdcard.load(self.print_path, self.gcode_text)
         cfg = self.print_task_config.print_task_config
         for tool in self.print_tools:
             if tool < 4:

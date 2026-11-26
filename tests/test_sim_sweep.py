@@ -18,6 +18,7 @@ class ResumeSweepTest(unittest.TestCase):
         self.assertEqual(KNOWN_STUCK - stuck, set(), 'fixed: remove from KNOWN_STUCK')
         self.assertGreaterEqual(sum(r[2] == 'resumed' for r in rows), 10)
 
+    @unittest.skipIf(sweep.FULL, 'BMCU_SIM_FULL runs more cases than SWEEP.md records')
     def test_committed_table_matches(self):
         rows = sweep.cached_sweep()
         path = os.path.join(os.path.dirname(sweep.__file__), 'SWEEP.md')
