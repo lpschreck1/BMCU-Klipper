@@ -856,6 +856,53 @@ class ArrivalFailureHintTest(unittest.TestCase):
         self.assertIn('snag', hint)
 
 
+class StockFeedFailureTest(unittest.TestCase):
+    """2026-11-25: Head 4's stock load failed move_extrude on a deformed tip,
+    after Snapmaker retried its extrude test for 5 minutes."""
+    def setUp(self):
+        self.m = manager_stub()
+        self.m._u1_stock_feed_inner = False
+        self.m._u1_prepared_heads = set()
+        self.m.printer_critical_section = lambda name: mock.MagicMock()
+        self.m._print_state = lambda: 'printing'
+        self.m._save_print_session = lambda: None
+        self.endpoint = types.SimpleNamespace(
+            native_path_status=lambda: {'known': True, 'channel_state': 'load_finish'})
+
+    def test_move_extrude_pause_says_what_to_do(self):
+        raw = ('extruder[3]: state: load_extruding, error: move_extrude!'
+               'raw msg:logic error!')
+        gcmd = types.SimpleNamespace(error=lambda message, **kw: RuntimeError(message))
+        message = str(M.BMCUManager._command_pause_error(gcmd, raw))
+        self.assertTrue(message.startswith(raw + ' Head 4: the stock feeder pushed'))
+        self.assertTrue(message.endswith('then Resume'))
+        # Not added twice when the message passes through again.
+        self.assertEqual(M._with_stock_feed_hint(message), message)
+
+    def test_tool_change_failure_gets_the_hint_and_the_banner_too(self):
+        m = manager_stub()
+        m._sync_status_cache_runtime = lambda: None
+        m._record_error('SNAPMAKER_TOOL_CHANGE_FAILED', phase='TOOL_CHANGE',
+                        details='extruder[0]: state: load_extruding, error: move_extrude!')
+        self.assertIn('Head 1: the stock feeder', m.last_error['details'])
+
+    def test_other_errors_unchanged(self):
+        for raw in ('extruder[1]: error: heat', 'ENDPOINT_NOT_REACHED: x. Clear it, then Resume'):
+            self.assertEqual(M._with_stock_feed_hint(raw), raw)
+
+    def test_resumed_load_counts_as_a_real_load(self):
+        self.m.gcode = types.SimpleNamespace(run_script_from_command=mock.Mock(
+            side_effect=[RuntimeError('move_extrude'), None, None]))
+        with self.assertRaises(RuntimeError):
+            self.m._run_u1_stock_auto_feed(self.endpoint, 3, 'test')
+        # Resume: Snapmaker still reports load_finish before the rerun.
+        self.assertTrue(self.m._run_u1_stock_auto_feed(self.endpoint, 3, 'test'))
+        self.assertIn(3, self.m._u1_prepared_heads)
+        # A later, genuinely already-loaded head is reported as such again.
+        self.m._u1_prepared_heads.clear()
+        self.assertFalse(self.m._run_u1_stock_auto_feed(self.endpoint, 3, 'test'))
+
+
 if __name__ == '__main__':
     logging.basicConfig(level=logging.CRITICAL)
     unittest.main()

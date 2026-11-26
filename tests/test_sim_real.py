@@ -234,7 +234,6 @@ class Incident5Test(unittest.TestCase):
         sim, state, elapsed = self.run_it(lambda: run_file(self, files[0]))
         self.check(sim, state, elapsed)
 
-    @unittest.expectedFailure
     def test_f13_the_pause_message_tells_the_user_which_head_and_what_to_do(self):
         sim = Sim.reference_machine()
         self.addCleanup(sim.close)

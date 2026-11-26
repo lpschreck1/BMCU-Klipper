@@ -39,6 +39,23 @@ U1_NATIVE_TOOL_COUNT = 4
 U1_LOGICAL_TOOL_LIMIT = 32
 # How long print start waits for a planner that is still scanning a large file.
 U1_PLANNER_BUSY_LIMIT_S = 600.0
+
+
+_SNAPMAKER_EXTRUDER_ERROR = re.compile(r'extruder\[(\d+)\][^!]*error:\s*move_extrude')
+
+
+def _with_stock_feed_hint(message):
+    """Snapmaker's own load errors don't say what to do; add it."""
+    message = str(message or '')
+    match = _SNAPMAKER_EXTRUDER_ERROR.search(message)
+    if match is None or 'could not grip it' in message:
+        return message
+    hint = ('Head %d: the stock feeder pushed the filament to the head but the '
+            'extruder could not grip it. Pull the filament out, cut the tip clean '
+            'at an angle, check the nozzle isn\'t clogged, then Resume' %
+            (int(match.group(1)) + 1))
+    base = message.rstrip()
+    return '%s%s%s' % (base, ' ' if base.endswith(('.', '!')) else '. ', hint)
 GENERIC_EXTERNAL_TOOL = 0
 GENERIC_BMCU_TOOL_MIN = 1
 GENERIC_LOGICAL_TOOL_LIMIT = 256
@@ -9103,7 +9120,8 @@ class BMCUManager(object):
     def _record_error(self, code, device='', channel=-1, endpoint='', phase='', details='', evidence=None):
         self.last_error = {
             'code': code, 'device': device, 'channel': channel,
-            'endpoint': endpoint, 'phase': phase, 'details': details,
+            'endpoint': endpoint, 'phase': phase,
+            'details': _with_stock_feed_hint(details),
             'evidence': evidence or {},
         }
         logging.error('BMCU %s', self.last_error)
@@ -9293,7 +9311,7 @@ class BMCUManager(object):
     @staticmethod
     def _command_pause_error(gcmd, message):
 
-        message = str(message)
+        message = _with_stock_feed_hint(str(message))
         try:
             return gcmd.error(
                 message, action='pause', id=522, index=0, code=0,
@@ -10009,9 +10027,16 @@ class BMCUManager(object):
                 'snapmaker_u1_stock_auto_feed'):
             previous_inner = self._u1_stock_feed_inner
             self._u1_stock_feed_inner = True
+            failed_heads = self.__dict__.setdefault(
+                '_u1_stock_feed_failed_heads', set())
             try:
                 self.gcode.run_script_from_command(
                     'SM_PRINT_AUTO_FEED EXTRUDER=%d' % int(head))
+            except Exception:
+                # Resume re-runs this load; Snapmaker's state can still say
+                # load_finish then, so remember that the load is a real one.
+                failed_heads.add(int(head))
+                raise
             finally:
                 self._u1_stock_feed_inner = previous_inner
             after = endpoint.native_path_status()
@@ -10024,7 +10049,9 @@ class BMCUManager(object):
                 '(before=%s after=%s)' %
                 (int(head), before.get('channel_state', 'unknown'),
                  after.get('channel_state', 'unknown')))
-        actual_load = not before_loaded
+        retried = int(head) in failed_heads
+        failed_heads.discard(int(head))
+        actual_load = retried or not before_loaded
         self._mark_u1_head_prepared(
             head, source=(source if actual_load else
                           '%s (already loaded before stock auto-feed)' % source))
