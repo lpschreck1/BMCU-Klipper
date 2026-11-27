@@ -203,12 +203,13 @@ class World(object):
         clog or a deformed tip never gets the filament into the zone. The reading is a
         state, so a filament the user pushes through by hand also reads high."""
         item = self.heads[head]
+        drift = float(getattr(item, 'coil_drift', 0.0) or 0.0)   # CoilDrift fault
         for source in item.sources:
             if source.tip is not None and source.tip >= source.nozzle_p - self.COIL_ZONE_MM:
-                return BASELINE_COIL + COIL_GOOD_DELTA
+                return BASELINE_COIL + COIL_GOOD_DELTA + drift
         if item.clog:
-            return BASELINE_COIL + COIL_MISS_DELTA
-        return BASELINE_COIL
+            return BASELINE_COIL + COIL_MISS_DELTA + drift
+        return BASELINE_COIL + drift
 
     # -- motion --------------------------------------------------------------
     def _limit(self, source, forward):

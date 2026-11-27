@@ -403,6 +403,22 @@ class Unrecorded(Fault):
         sim.world.pull(source, source.tip or 0.0)
 
 
+class CoilDrift(Fault):
+    """The Head coil's reading moves with no filament moving: 2026-11-26 on the
+    printer it rose by 1078 (Head 3) and 2318 (Head 4) over a pause."""
+    name = 'coil_drift'
+
+    def __init__(self, head, amount):
+        self.head = int(head)
+        self.amount = float(amount)
+
+    def apply(self, sim):
+        sim.world.heads[self.head].coil_drift = self.amount
+
+    def clear(self, sim):
+        sim.world.heads[self.head].coil_drift = 0.0
+
+
 class WeakPressure(Fault):
     """2026-11-26, bmcu0 Channel 2 into Head 3: the BEFORE_ON_USE pressure hold
     squeezed the buffer to its target and stopped, with the tip short of the gears.

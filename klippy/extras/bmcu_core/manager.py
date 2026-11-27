@@ -2224,19 +2224,55 @@ class BMCUManager(object):
 
     def _u1_drive_to_coil(self, device, channel, endpoint, material, baseline,
                           threshold, remaining_mm=None):
-        """Head-first push into the gears, then the normal BEFORE_ON_USE run to the
-        coil with the pressure hold, then the coil check against ``baseline``."""
+        """Push into the gears, then the normal BEFORE_ON_USE run to the coil with
+        the pressure hold, then the coil check.
+
+        The coil is compared with a baseline read here, just before the push, at
+        the temperature the check runs at. A baseline from before a pause is no
+        good: on 2026-11-26 the coil drifted by 1078 and 2318 over two pauses with
+        no filament moving, a Resume took that for a load, and the print went on
+        with nothing in the Head (air printing). ``baseline`` is ignored."""
+        del baseline
+        fresh = endpoint.capture_signal()
+        if fresh is None:
+            raise EndpointError(
+                'U1_TOOLHEAD_RECOVERY_EVIDENCE_MISSING: %s coil could not be read '
+                'before the push' % endpoint.name)
+        baseline = float(fresh)
+        device.refresh()
+        before_push_m = float(device.status['meters'][channel])
         pushed = self._u1_push_into_turning_gears(device, channel, endpoint)
         device.set_motion(channel, protocol.MOTION_BEFORE_ON_USE)
         remaining = float(remaining_mm or 34.0)
         endpoint.extrude(max(5.0, min(remaining, 70.0)), 360.0)
-        evidence = endpoint.verify_loaded_after_pause(
-            material, baseline=baseline, threshold=threshold)
+        device.refresh()
+        # The gears pulled filament through if the BMCU encoder followed the Head
+        # (after the push, so the slow turn and the run). Filament the user already
+        # fed to the nozzle by hand reads high in the fresh baseline too, so the
+        # coil alone cannot tell; the encoder can. The slow turn counts too: a
+        # buffer the push left compressed gives up its slack first.
+        followed = (float(device.status['meters'][channel]) -
+                    pushed / 1000.0 - before_push_m) * 1000.0
+        try:
+            evidence = endpoint.verify_loaded_after_pause(
+                material, baseline=baseline, threshold=threshold)
+        except EndpointError as exc:
+            if followed < self.U1_DRIVE_FOLLOW_MIN_MM:
+                raise EndpointError(
+                    '%s; and %s Channel %d moved only %.1f mm while the Head '
+                    'turned' % (exc, device.name, channel + 1, followed))
+            logging.info(
+                'BMCU %s Channel %d followed the Head %.1f mm: loaded, though the '
+                'coil was already high (filament fed by hand)',
+                device.name, channel + 1, followed)
+            evidence = {'coil_confirmed': False}
         evidence = dict(evidence or {})
         evidence['assist_push_mm'] = pushed
+        evidence['followed_mm'] = followed
         return evidence
 
     U1_RECOVERY_RELOAD_EMPTY = True
+    U1_DRIVE_FOLLOW_MIN_MM = 15.0     # encoder motion that proves the gears pull it
 
     def _u1_recovery_feed_again(self, device, channel, endpoint, material, pending,
                                 temperature_profile=None):
@@ -16479,17 +16515,13 @@ class BMCUManager(object):
 
             if recovery_phase == 'verify':
                 self._set_phase(device, 'RESUME_BEFORE_ON_USE_VERIFY', channel=channel)
-                try:
-                    endpoint.verify_loaded_after_pause(
-                        material=material,
-                        baseline=pending.get('coil_baseline'),
-                        threshold=pending.get('coil_threshold'))
-                except EndpointError:
-                    # 2026-11-26: the user trimmed the tip and pressed Resume, and
-                    # nothing fed it. Feed it again instead of refusing.
-                    self._u1_recovery_feed_again(
-                        device, channel, endpoint, material, pending,
-                        temperature_profile)
+                # Never accept the load on a coil read alone: the coil drifts over a
+                # pause (2026-11-26, an air print after Resume). Heat, feed it back
+                # to the Head sensor if needed, push it into the gears and check
+                # the coil against a fresh baseline, every time.
+                self._u1_recovery_feed_again(
+                    device, channel, endpoint, material, pending,
+                    temperature_profile)
                 endpoint.suspend_managed_sensors()
                 self._endpoint_temperature_call(
                     endpoint, 'prepare_load', material, temperature_profile,

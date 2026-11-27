@@ -493,6 +493,47 @@ class TrimThenResumeTest(unittest.TestCase):
                 sim.user.resume()
 
 
+class CoilDriftAirPrintTest(unittest.TestCase):
+    """2026-11-26 on the printer: a load failed (and the assist push), the Head coil
+    drifted over the pause (+1078 on Head 3, +2318 on Head 4), and the Resume
+    recovery read the coil alone against the pre-pause baseline, took the drift for
+    a load, primed and printed with nothing in the Head."""
+
+    def paused_with_drift(self):
+        sim = make_sim(self, plan=[[0], [4], [5], [3]],
+                       spools={0: 'PLA grey', 4: 'PLA red', 5: 'PLA blue', 3: 'PLA white'})
+        sim.inject(F.GcodeLine('PRINT_START'), F.DeformedTip('bmcu1'))
+        sim.start()
+        self.assertEqual(sim.run_until_stopped(), 'paused')
+        self.assertIn('U1_TOOLHEAD_NOT_LOADED', sim.print_stats.message)
+        F.CoilDrift(2, 1500.0).apply(sim)
+        return sim
+
+    def test_resume_does_not_take_the_drift_for_a_load(self):
+        sim = self.paused_with_drift()
+        with self.assertRaises(CommandError) as ctx:
+            sim.user.resume()                   # tip still bent: it must refuse
+        self.assertIn('U1_TOOLHEAD_NOT_LOADED', str(ctx.exception))
+        self.assertLessEqual(sim.dry_mm().get(2, 0.0), checks.DRY_TOLERANCE_MM)
+        # the user trims the tip; the next Resume loads it and the print finishes
+        sim.world.sources['bmcu1'].quality = 'good'
+        self.assertEqual(sim.user.resume(), 'complete', sim.print_stats.message)
+        self.assertEqual(checks.verify(sim), [])
+
+    def test_negative_control_the_old_coil_read_air_prints(self):
+        sim = self.paused_with_drift()
+        def old_verify(self, device, channel, endpoint, material, pending,
+                       temperature_profile=None):
+            endpoint.verify_loaded_after_pause(
+                material=material, baseline=pending.get('coil_baseline'),
+                threshold=pending.get('coil_threshold'))
+        with mock.patch.object(M.BMCUManager, '_u1_recovery_feed_again', old_verify):
+            state = sim.user.resume()
+        self.assertEqual(state, 'complete')
+        self.assertTrue(any('printed' in p and 'did not have' in p
+                            for p in checks.verify(sim)), checks.verify(sim))
+
+
 class BufferSlackIdentifyTest(unittest.TestCase):
     """2026-11-26 on the printer: a failed load left bmcu0 Channel 3's buffer at 82 %.
     Identifying the Head 4 filament saw 0.0 mm on two Resume presses and 11 mm on the
