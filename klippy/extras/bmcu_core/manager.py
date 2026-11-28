@@ -1691,6 +1691,14 @@ class BMCUManager(object):
         if loaded:
             return loaded[0]
         tools = []
+        pending = getattr(self, '_u1_toolchange_resume_pending', None)
+        if (isinstance(pending, dict) and pending.get('kind') == 'before_on_use' and
+                pending.get('endpoint') == endpoint.name):
+            # The load that failed on this Head. 2026-11-27: a print-start load
+            # (the Head's only tool, so no tool change in the plan) failed, and
+            # without this the Head got no filament info and Resume was refused
+            # ("e2 not edit filament").
+            tools.append(pending.get('tool', -1))
         cursor = getattr(self, '_u1_toolchange_cursor', -1)
         plan = getattr(self, '_u1_toolchange_plan', []) or []
         if isinstance(cursor, int) and 0 <= cursor < len(plan):

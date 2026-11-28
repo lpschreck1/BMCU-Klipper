@@ -475,8 +475,12 @@ class TrimThenResumeTest(unittest.TestCase):
         self.assert_finished(sim, sim.user.resume())
 
     def test_without_reloading_an_empty_route_resume_fails(self):
+        # Two things reload it: the resume pre-load (which now finds the failed
+        # tool's route) and the recovery's EMPTY branch. Without both it fails.
         sim = self.paused_then_trimmed(-40.0)
-        with mock.patch.object(M.BMCUManager, 'U1_RECOVERY_RELOAD_EMPTY', False):
+        with mock.patch.object(M.BMCUManager, 'U1_RECOVERY_RELOAD_EMPTY', False), \
+                mock.patch.object(M.BMCUManager, '_u1_resume_load_bmcu_source',
+                                  lambda self, head, gcmd: False):
             with self.assertRaises(CommandError):
                 sim.user.resume()
 
@@ -532,6 +536,38 @@ class CoilDriftAirPrintTest(unittest.TestCase):
         self.assertEqual(state, 'complete')
         self.assertTrue(any('printed' in p and 'did not have' in p
                             for p in checks.verify(sim)), checks.verify(sim))
+
+
+class PrintStartOnlyToolNoFilamentInfoTest(unittest.TestCase):
+    """2026-11-27 on the printer: a print whose only tool on Head 3 is the first one
+    (no tool change for it in the plan) failed its print-start load. The user pulled
+    the filament out and back (the stock sensor's remove event clears the Head's
+    filament info), and every Resume was refused: 'e2 not edit filament'. BMCU's
+    resume projection found no route for the Head."""
+
+    def paused_and_cleared(self):
+        sim = make_sim(self, plan=[[5]], spools={5: 'PLA red'})
+        sim.inject(F.GcodeLine('PRINT_START'), F.DeformedTip('bmcu1'))
+        sim.start()
+        self.assertEqual(sim.run_until_stopped(), 'paused')
+        self.assertIn('U1_TOOLHEAD_NOT_LOADED', sim.print_stats.message)
+        sim.world.sources['bmcu1'].quality = 'good'        # the user trims it
+        cfg = sim.print_task_config.print_task_config
+        for key in ('filament_type', 'filament_vendor', 'filament_sub_type'):
+            cfg[key][2] = 'NONE'                           # what the remove event does
+        return sim
+
+    def test_resume_projects_the_failed_tool_and_finishes(self):
+        sim = self.paused_and_cleared()
+        self.assertEqual(sim.user.resume(), 'complete', sim.print_stats.message)
+        self.assertEqual(checks.verify(sim), [])
+
+    def test_without_the_failed_tool_resume_is_refused(self):
+        sim = self.paused_and_cleared()
+        sim.manager._u1_toolchange_resume_pending.clear()
+        with self.assertRaises(CommandError) as ctx:
+            sim.user.resume()
+        self.assertIn('not edit filament', str(ctx.exception))
 
 
 class BufferSlackIdentifyTest(unittest.TestCase):
